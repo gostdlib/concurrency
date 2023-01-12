@@ -18,6 +18,7 @@ type Mutator[T, R any] func(context.Context, T) (R, error)
 // Slice applies Mutator "m" to each element in "s" using the goroutines Pool
 // "p". If p == nil, p becomes a limited.Pool using up to runtime.NumCPU().
 // Errors will be returned, but will not stop this from completing.
+// Values at the position that return an error will remain unchanged.
 func Slice[T any](ctx context.Context, s []T, m Mutator[T, T], p goroutines.Pool) error {
 	if len(s) == 0 {
 		return nil
@@ -58,6 +59,8 @@ func Slice[T any](ctx context.Context, s []T, m Mutator[T, T], p goroutines.Pool
 }
 
 // ResultSlice takes values in slice "s" and applies Mutator "m" to get a new result slice []R.
+// Errors will be returned, but will not stop this from completing. Values at the
+// position that return an error will be the zero value for the R type.
 func ResultSlice[T, R any](ctx context.Context, s []T, m Mutator[T, R], p goroutines.Pool) ([]R, error) {
 	if len(s) == 0 {
 		if s == nil {
@@ -89,7 +92,13 @@ func ResultSlice[T, R any](ctx context.Context, s []T, m Mutator[T, R], p gorout
 			},
 		)
 	}
-	return results, *ptr.Load()
+	p.Wait()
+
+	errPtr := ptr.Load()
+	if errPtr != nil {
+		return results, *errPtr
+	}
+	return results, nil
 }
 
 func applyErr(ptr *atomic.Pointer[error], err error) {
