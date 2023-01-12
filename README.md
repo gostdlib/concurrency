@@ -1,2 +1,2 @@
-# pipelines
-Packages for creating data pipelines
+# Concurrency
+Packages for handling Go concurrency.
