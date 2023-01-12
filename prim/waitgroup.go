@@ -4,10 +4,8 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 
 	"github.com/gostdlib/concurrency/goroutines"
-	"github.com/gostdlib/concurrency/prim/internal/race"
 )
 
 // FunCall is a function call that can be used in various functions or methods
@@ -18,9 +16,7 @@ type FuncCall func(ctx context.Context) error
 // goroutines in safer way by handling the .Add() and .Done() methods. This prevents
 // problems where you forget to increment or decrement the sync.WaitGroup. In
 // addition you can use a goroutines.Pool object to allow concurrency control
-// and goroutine reuse. This version of the WaitGroup provides a WaitCtx() that
-// can have its Context cancelled to allow exiting a problematic WaitGroup. This can
-// be handy for debugging. It also provides a Running() method that keeps track of
+// and goroutine reuse. It provides a Running() method that keeps track of
 // how many GoRoutines are running. This can be used with the goroutines.Pool stats
 // to understand what goroutines are in use. It has a CancelOnErr() method to
 // allow mimicing of the golang.org/x/sync/errgroup package.
@@ -35,16 +31,17 @@ type WaitGroup struct {
 
 	count  atomic.Int64
 	errors atomic.Pointer[error]
-	wg     waitGroup
+	wg     sync.WaitGroup
 
 	cancel context.CancelFunc
 }
 
 // CancelOnErr cancels all goroutines in the WaitGroup spawned by Go() if there
-// is an error. ctx must be the same Context object you will pass in the Go() calls.
-// This is reset after a Wait() or WaitCtx completes successfully.
-func (w *WaitGroup) CancelOnErr(ctx context.Context) {
-	_, w.cancel = context.WithCancel(ctx)
+// is an error. cancel must be a CancelFunc on the same Context object you will
+// pass in the Go() calls. This is reset after a Wait() or WaitCtx completes
+// successfully.
+func (w *WaitGroup) CancelOnErr(cancel context.CancelFunc) {
+	w.cancel = cancel
 }
 
 // Go spins off a goroutine that executes f(ctx). This will use the underlying
@@ -89,20 +86,11 @@ func (w *WaitGroup) Running() int {
 
 // Wait blocks until all goroutines are finshed.
 func (w *WaitGroup) Wait() {
-	w.wg.Wait(context.Background())
-	w.cancel()
-	w.cancel = nil
-}
-
-// WaitCtx is like Wait except the Context can be cancelled to end the blocking.
-// The returned bool is true if WaitCtx succeeded (the context was not cancelled).
-func (w *WaitGroup) WaitCtx(ctx context.Context) bool {
-	if w.wg.Wait(ctx) {
+	w.wg.Wait()
+	if w.cancel != nil {
 		w.cancel()
 		w.cancel = nil
-		return true
 	}
-	return false
 }
 
 // Err returns all errors in the various goroutines that were run.
@@ -110,6 +98,7 @@ func (w *WaitGroup) Err() error {
 	return *w.errors.Load()
 }
 
+/*
 // A WaitGroup waits for a collection of goroutines to finish.
 // The main goroutine calls Add to set the number of
 // goroutines to wait for. Then each of the goroutines
@@ -217,7 +206,9 @@ func (wg *waitGroup) Wait(ctx context.Context) bool {
 		race.Disable()
 	}
 	for {
+		log.Println("this is happening")
 		if ctx.Err() != nil {
+			log.Println("this happened")
 			if race.Enabled {
 				race.Enable()
 				race.Acquire(unsafe.Pointer(wg))
@@ -287,3 +278,4 @@ func runtime_SemacquireMutex(s *uint32, lifo bool, skipframes int)
 //
 //go:linkname runtime_Semrelease sync.runtime_Semrelease
 func runtime_Semrelease(s *uint32, handoff bool, skipframes int)
+*/

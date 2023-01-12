@@ -3,6 +3,7 @@ package prim
 import (
 	"context"
 	"fmt"
+	"log"
 	"runtime"
 	"sync/atomic"
 
@@ -16,6 +17,7 @@ type Mutator[T, R any] func(context.Context, T) (R, error)
 
 // Slice applies Mutator "m" to each element in "s" using the goroutines Pool
 // "p". If p == nil, p becomes a limited.Pool using up to runtime.NumCPU().
+// Errors will be returned, but will not stop this from completing.
 func Slice[T any](ctx context.Context, s []T, m Mutator[T, T], p goroutines.Pool) error {
 	if len(s) == 0 {
 		return nil
@@ -25,7 +27,7 @@ func Slice[T any](ctx context.Context, s []T, m Mutator[T, T], p goroutines.Pool
 		var err error
 		p, err = limited.New(runtime.NumCPU())
 		if err != nil {
-			panic(err)
+			return err
 		}
 	}
 
@@ -36,6 +38,8 @@ func Slice[T any](ctx context.Context, s []T, m Mutator[T, T], p goroutines.Pool
 		p.Submit(
 			ctx,
 			func(ctx context.Context) {
+				log.Println("doing: ", i)
+				defer log.Println("exiting: ", i)
 				var err error
 				s[i], err = m(ctx, s[i])
 				if err != nil {
@@ -44,7 +48,13 @@ func Slice[T any](ctx context.Context, s []T, m Mutator[T, T], p goroutines.Pool
 			},
 		)
 	}
-	return *ptr.Load()
+	p.Wait()
+
+	errPtr := ptr.Load()
+	if errPtr != nil {
+		return *errPtr
+	}
+	return nil
 }
 
 // ResultSlice takes values in slice "s" and applies Mutator "m" to get a new result slice []R.
@@ -94,7 +104,7 @@ func applyErr(ptr *atomic.Pointer[error], err error) {
 				return
 			}
 			err = fmt.Errorf("%w", err)
-			if ptr.CompareAndSwap(nil, &err) {
+			if ptr.CompareAndSwap(existing, &err) {
 				return
 			}
 		}
