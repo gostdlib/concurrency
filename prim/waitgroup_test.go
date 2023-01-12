@@ -48,10 +48,8 @@ func TestWaitGroupBasic(t *testing.T) {
 
 func TestWaitGroupCancelOnErr(t *testing.T) {
 	// setup
-	var wg WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
-
-	wg.CancelOnErr(cancel)
+	wg := WaitGroup{CancelOnErr: cancel}
 
 	// spin off 5 go routines
 	for i := 0; i < 5; i++ {
@@ -68,9 +66,7 @@ func TestWaitGroupCancelOnErr(t *testing.T) {
 			},
 		)
 	}
-	wg.Wait()
-
-	if wg.Err() == nil {
+	if err := wg.Wait(); err == nil {
 		t.Errorf("TestWaitGroupCancelOnErr: want error != nil, got nil")
 	}
 }

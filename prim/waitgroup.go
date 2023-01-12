@@ -28,36 +28,35 @@ type WaitGroup struct {
 	Name string
 	// Pool is an optional goroutines.Pool for concurrency control and reuse.
 	Pool goroutines.Pool
+	// CancelOnErr holds a CancelFunc that will be called if any goroutine
+	// returns an error. This will automatically be called when Wait() is
+	// finishecd and then reset to nil.
+	CancelOnErr context.CancelFunc
 
 	count  atomic.Int64
 	errors atomic.Pointer[error]
 	wg     sync.WaitGroup
-
-	cancel context.CancelFunc
-}
-
-// CancelOnErr cancels all goroutines in the WaitGroup spawned by Go() if there
-// is an error. cancel must be a CancelFunc on the same Context object you will
-// pass in the Go() calls. This is reset after a Wait() or WaitCtx completes
-// successfully.
-func (w *WaitGroup) CancelOnErr(cancel context.CancelFunc) {
-	w.cancel = cancel
 }
 
 // Go spins off a goroutine that executes f(ctx). This will use the underlying
 // goroutines.Pool if provided.
 func (w *WaitGroup) Go(ctx context.Context, f FuncCall) {
-	w.wg.Add(1)
 	w.count.Add(1)
 
 	if w.Pool == nil {
+		w.wg.Add(1)
 		go func() {
 			defer w.count.Add(-1)
 			defer w.wg.Done()
+
+			if ctx.Err() != nil {
+				return
+			}
+
 			if err := f(ctx); err != nil {
 				applyErr(&w.errors, err)
-				if w.cancel != nil {
-					w.cancel()
+				if w.CancelOnErr != nil {
+					w.CancelOnErr()
 				}
 			}
 		}()
@@ -67,11 +66,15 @@ func (w *WaitGroup) Go(ctx context.Context, f FuncCall) {
 	w.Pool.Submit(
 		ctx,
 		func(ctx context.Context) {
+			if ctx.Err() != nil {
+				return
+			}
+
 			if err := f(ctx); err != nil {
 				if err := f(ctx); err != nil {
 					applyErr(&w.errors, err)
-					if w.cancel != nil {
-						w.cancel()
+					if w.CancelOnErr != nil {
+						w.CancelOnErr()
 					}
 				}
 			}
@@ -85,17 +88,21 @@ func (w *WaitGroup) Running() int {
 }
 
 // Wait blocks until all goroutines are finshed.
-func (w *WaitGroup) Wait() {
-	w.wg.Wait()
-	if w.cancel != nil {
-		w.cancel()
-		w.cancel = nil
+func (w *WaitGroup) Wait() error {
+	if w.Pool == nil {
+		w.wg.Wait()
+	} else {
+		w.Pool.Wait()
 	}
-}
-
-// Err returns all errors in the various goroutines that were run.
-func (w *WaitGroup) Err() error {
-	return *w.errors.Load()
+	if w.CancelOnErr != nil {
+		w.CancelOnErr()
+		w.CancelOnErr = nil
+	}
+	err := w.errors.Load()
+	if err != nil {
+		return *err
+	}
+	return nil
 }
 
 /*
