@@ -6,7 +6,7 @@
 The `prim` package is your one stop shop for advanced concurrency primatives to create robust and easy to diagnose applications.
 
 ```sh
-go get github.com/gostdlib/concurrency/prim
+go get github.com/gostdlib/concurrency/
 ```
 
 # A quick look
