@@ -153,8 +153,8 @@ type Pool interface {
 
 // Errors is a concurrency safe way of capturing a set of errors in multiple goroutines.
 type Errors struct {
-	errors []error
 	mu     sync.Mutex
+	errors []error
 }
 
 // Record writes an error to Errors.

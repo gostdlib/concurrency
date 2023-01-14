@@ -25,20 +25,19 @@ type FuncCall func(ctx context.Context) error
 // be named via the WaitGroup.Name string. This will provide span messages on the
 // current span when Wait() is called and record any errors in the span.
 type WaitGroup struct {
-	// Name provides an optional name for a WaitGroup for the purpose of
-	// OTEL logging information.
-	Name string
+	count  atomic.Int64
+	total  atomic.Int64
+	errors atomic.Pointer[error]
+	wg     sync.WaitGroup
 	// Pool is an optional goroutines.Pool for concurrency control and reuse.
 	Pool goroutines.Pool
 	// CancelOnErr holds a CancelFunc that will be called if any goroutine
 	// returns an error. This will automatically be called when Wait() is
 	// finishecd and then reset to nil.
 	CancelOnErr context.CancelFunc
-
-	count  atomic.Int64
-	total  atomic.Int64
-	errors atomic.Pointer[error]
-	wg     sync.WaitGroup
+	// Name provides an optional name for a WaitGroup for the purpose of
+	// OTEL logging information.
+	Name string
 }
 
 // Go spins off a goroutine that executes f(ctx). This will use the underlying

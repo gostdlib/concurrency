@@ -24,9 +24,9 @@ var _ goroutines.Pool = &Pool{}
 
 // Pool is a pool of goroutines.
 type Pool struct {
-	queue   chan struct{}
 	wg      sync.WaitGroup
 	running atomic.Int64
+	queue   chan struct{}
 }
 
 // New creates a new Pool. Size is the number of goroutines that can execute concurrently.
