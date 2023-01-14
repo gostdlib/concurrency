@@ -46,6 +46,7 @@ func ExampleResultSlice() {
 // the sync.WaitGroup example at https://golang.org/pkg/sync/#example_WaitGroup.
 // This example is derived from errgroup.Group from golang.org/x/sync/errgroup.
 func ExampleWaitGroup_just_errors() {
+	ctx := context.Background()
 	wg := WaitGroup{}
 
 	var urls = []string{
@@ -56,7 +57,7 @@ func ExampleWaitGroup_just_errors() {
 	for _, url := range urls {
 		// Launch a goroutine to fetch the URL.
 		url := url // https://golang.org/doc/faq#closures_and_goroutines
-		wg.Go(context.Background(), func(ctx context.Context) error {
+		wg.Go(ctx, func(ctx context.Context) error {
 			// Fetch the URL.
 			resp, err := http.Get(url)
 			if err == nil {
@@ -67,7 +68,7 @@ func ExampleWaitGroup_just_errors() {
 	}
 
 	// Wait for all HTTP fetches to complete.
-	if err := wg.Wait(); err != nil {
+	if err := wg.Wait(ctx); err != nil {
 		fmt.Println("Successfully fetched all URLs.")
 	}
 }
@@ -107,7 +108,7 @@ func ExampleWaitGroup_parallel() {
 				return err
 			})
 		}
-		if err := wg.Wait(); err != nil {
+		if err := wg.Wait(ctx); err != nil {
 			return nil, err
 		}
 		return results, nil
@@ -150,7 +151,7 @@ func ExampleWaitGroup_cancel_on_err() {
 		)
 	}
 
-	if err := wg.Wait(); err != nil {
+	if err := wg.Wait(ctx); err != nil {
 		fmt.Println(err)
 	}
 

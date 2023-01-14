@@ -12,8 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/johnsiilver/pools/goroutines"
-	"github.com/johnsiilver/pools/goroutines/internal/pool"
+	"github.com/gostdlib/concurrency/goroutines"
+	"github.com/gostdlib/concurrency/goroutines/internal/pool"
 )
 
 var _ goroutines.Pool = &Pool{}

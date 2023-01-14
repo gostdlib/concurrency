@@ -38,7 +38,7 @@ func TestWaitGroupBasic(t *testing.T) {
 	close(exit)
 
 	// wait for all go routines to finish
-	wg.Wait()
+	wg.Wait(context.Background())
 
 	// check that running count is 0 after wait
 	if wg.Running() != 0 {
@@ -66,7 +66,7 @@ func TestWaitGroupCancelOnErr(t *testing.T) {
 			},
 		)
 	}
-	if err := wg.Wait(); err == nil {
+	if err := wg.Wait(ctx); err == nil {
 		t.Errorf("TestWaitGroupCancelOnErr: want error != nil, got nil")
 	}
 }

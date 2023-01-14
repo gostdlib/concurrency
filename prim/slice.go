@@ -9,6 +9,7 @@ import (
 
 	"github.com/gostdlib/concurrency/goroutines"
 	"github.com/gostdlib/concurrency/goroutines/limited"
+	"github.com/gostdlib/internals/otel/span"
 )
 
 // Mutator is a function that takes in a value T and returns an element T that
@@ -20,6 +21,8 @@ type Mutator[T, R any] func(context.Context, T) (R, error)
 // Errors will be returned, but will not stop this from completing.
 // Values at the position that return an error will remain unchanged.
 func Slice[T any](ctx context.Context, s []T, m Mutator[T, T], p goroutines.Pool) error {
+	spanner := span.Get(ctx)
+
 	if len(s) == 0 {
 		return nil
 	}
@@ -28,6 +31,7 @@ func Slice[T any](ctx context.Context, s []T, m Mutator[T, T], p goroutines.Pool
 		var err error
 		p, err = limited.New(runtime.NumCPU())
 		if err != nil {
+			spanner.Error(err)
 			return err
 		}
 	}
@@ -53,6 +57,7 @@ func Slice[T any](ctx context.Context, s []T, m Mutator[T, T], p goroutines.Pool
 
 	errPtr := ptr.Load()
 	if errPtr != nil {
+		spanner.Error(*errPtr)
 		return *errPtr
 	}
 	return nil
@@ -62,6 +67,8 @@ func Slice[T any](ctx context.Context, s []T, m Mutator[T, T], p goroutines.Pool
 // Errors will be returned, but will not stop this from completing. Values at the
 // position that return an error will be the zero value for the R type.
 func ResultSlice[T, R any](ctx context.Context, s []T, m Mutator[T, R], p goroutines.Pool) ([]R, error) {
+	spanner := span.Get(ctx)
+
 	if len(s) == 0 {
 		if s == nil {
 			return nil, nil
@@ -73,6 +80,7 @@ func ResultSlice[T, R any](ctx context.Context, s []T, m Mutator[T, R], p gorout
 		var err error
 		p, err = limited.New(runtime.NumCPU())
 		if err != nil {
+			spanner.Error(err)
 			return nil, err
 		}
 	}
@@ -96,6 +104,7 @@ func ResultSlice[T, R any](ctx context.Context, s []T, m Mutator[T, R], p gorout
 
 	errPtr := ptr.Load()
 	if errPtr != nil {
+		spanner.Error(*errPtr)
 		return results, *errPtr
 	}
 	return results, nil
