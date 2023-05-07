@@ -9,6 +9,8 @@ import (
 )
 
 func TestSlice(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	tests := []struct {
 		desc string
@@ -59,6 +61,8 @@ func TestSlice(t *testing.T) {
 }
 
 func TestResultSlice(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	tests := []struct {
 		desc string

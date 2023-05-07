@@ -3,10 +3,15 @@ package pooled
 import (
 	"context"
 	"testing"
+
+	"github.com/gostdlib/concurrency/goroutines"
 )
 
+//lint:ignore U1000 This is for internal use only.
+var g goroutines.Pool = &Pool{}
+
 func TestPool(t *testing.T) {
-	p, err := New(100)
+	p, err := New("myPool", 100)
 	if err != nil {
 		panic(err)
 	}

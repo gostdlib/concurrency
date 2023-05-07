@@ -4,12 +4,12 @@ implement/use. Implementations are in sub-directories and can be used directly
 without using this package.
 
 As this is the parent package, we will show some basic examples that are valid across
-all implementations using the "pooled" package.
+all implementations using the "pooled" sub-package that implements the Pool interface found here.
 
 Example of using a pool where errors don't matter:
 
 	ctx := context.Background()
-	p, err := pooled.New(runtime.NumCPU())
+	p, err := pooled.New("name", runtime.NumCPU())
 	if err != nil {
 		panic(err)
 	}
@@ -33,7 +33,7 @@ Example of using a pool where errors occur, but shouldn't stop execution:
 	ctx := context.Background()
 	client := http.Client{}
 
-	p, err := pooled.New(runtime.NumCPU())
+	p, err := pooled.New("name", runtime.NumCPU())
 	if err != nil {
 		panic(err)
 	}
@@ -44,7 +44,7 @@ Example of using a pool where errors occur, but shouldn't stop execution:
 
 	// urls would just be some []string containing URLs.
 	for _, url := range urls {
-		i := i
+		url := url
 
 		p.Submit(
 			ctx,
@@ -85,7 +85,7 @@ Example of using a pool where errors occur and should stop exeuction:
 	ctx, cancel := context.WithCancel(context.Background())
 	client := http.Client{}
 
-	p, err := pooled.New(runtime.NumCPU())
+	p, err := pooled.New("name", runtime.NumCPU())
 	if err != nil {
 		panic(err)
 	}
@@ -96,7 +96,7 @@ Example of using a pool where errors occur and should stop exeuction:
 
 	// urls would just be some []string containing URLs.
 	for _, url := range urls {
-		i := i
+		url := url
 
 		if ctx.Err() != nil {
 			break
@@ -130,13 +130,14 @@ import (
 	"github.com/gostdlib/concurrency/goroutines/internal/pool"
 )
 
-// Job is a job for a Pool.
+// Job is a job for a Pool to execute.
 type Job func(ctx context.Context)
 
 // SubmitOption is an option for Pool.Submit().
 type SubmitOption func(opt *pool.SubmitOptions) error
 
-// Pool is the minimum interface that any goroutine pool must implement.
+// Pool is the minimum interface that any goroutine pool must implement. This can
+// only be created by using a sub-package that implements this interface.
 type Pool interface {
 	// Submit submits a Job to be run.
 	Submit(ctx context.Context, runner Job, options ...SubmitOption) error
@@ -149,6 +150,13 @@ type Pool interface {
 	Len() int
 	// Running returns how many goroutines are currently in flight.
 	Running() int
+
+	// GetName gets the name of the goroutines pool. This may differ from the name
+	// that was passed in when creating the pool. This can be caused by a naming conflict,
+	// which causes the name to be appended by a dash(-) and a number.
+	GetName() string
+
+	pool.Preventer // Prevents outside packages from implementing Pool.
 }
 
 // Errors is a concurrency safe way of capturing a set of errors in multiple goroutines.

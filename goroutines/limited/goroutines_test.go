@@ -4,10 +4,15 @@ import (
 	"context"
 	"runtime"
 	"testing"
+
+	"github.com/gostdlib/concurrency/goroutines"
 )
 
+//lint:ignore U1000 This is for internal use only.
+var g goroutines.Pool = &Pool{}
+
 func TestPool(t *testing.T) {
-	p, err := New(runtime.NumCPU())
+	p, err := New("name", runtime.NumCPU())
 	if err != nil {
 		panic(err)
 	}

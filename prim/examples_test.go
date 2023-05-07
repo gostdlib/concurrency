@@ -43,7 +43,6 @@ func ExampleResultSlice() {
 
 // JustErrors illustrates the use of WaitGroup in place of a sync.WaitGroup to
 // simplify goroutine counting and error handling. This example is derived from
-// the sync.WaitGroup example at https://golang.org/pkg/sync/#example_WaitGroup.
 // This example is derived from errgroup.Group from golang.org/x/sync/errgroup.
 func ExampleWaitGroup_just_errors() {
 	ctx := context.Background()
@@ -133,7 +132,7 @@ func ExampleWaitGroup_parallel() {
 // cancel all remaining tasks if a single task has an error.
 func ExampleWaitGroup_cancel_on_err() {
 	ctx, cancel := context.WithCancel(context.Background())
-	p, _ := pooled.New(10)
+	p, _ := pooled.New("poolName", 10)
 
 	wg := WaitGroup{Pool: p, CancelOnErr: cancel}
 

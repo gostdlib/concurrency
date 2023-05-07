@@ -2,7 +2,6 @@ package prim
 
 import (
 	"context"
-	"fmt"
 	"runtime"
 	"sync/atomic"
 
@@ -11,18 +10,20 @@ import (
 	"github.com/gostdlib/internals/otel/span"
 )
 
-// Mutator is a function that takes in a value T and returns an element R.
-// T and R can be the same type.
-type Mutator[T, R any] func(context.Context, T) (R, error)
+// MapMutator is a function that takes in a key K and value V and returns a key and value
+// that should be set in a map.
+type MapMutator[K comparable, V any] func(ctx context.Context, key K, val V) (K, V, error)
 
-// Slice applies Mutator "m" to each element in "s" using the goroutines Pool
+// Map applies MapMutator "mut" to each element in map "m" using the goroutines Pool
 // "p". If p == nil, p becomes a limited.Pool using up to runtime.NumCPU().
+// Mutations may not change the key passed and instead may change a different key or
+// add a new key.
 // Errors will be returned, but will not stop this from completing.
 // Values at the position that return an error will remain unchanged.
-func Slice[T any](ctx context.Context, s []T, mut Mutator[T, T], p goroutines.Pool, subOpts ...goroutines.SubmitOption) error {
+func Map[K comparable, V any](ctx context.Context, m map[K]V, mut MapMutator[K, V], p goroutines.Pool, subOpts ...goroutines.SubmitOption) error {
 	spanner := span.Get(ctx)
 
-	if len(s) == 0 {
+	if len(m) == 0 {
 		return nil
 	}
 
@@ -38,8 +39,9 @@ func Slice[T any](ctx context.Context, s []T, mut Mutator[T, T], p goroutines.Po
 
 	ptr := atomic.Pointer[error]{}
 
-	for i := 0; i < len(s); i++ {
-		i := i
+	for k, v := range m {
+		k := k
+		v := v
 
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -48,11 +50,12 @@ func Slice[T any](ctx context.Context, s []T, mut Mutator[T, T], p goroutines.Po
 		err := p.Submit(
 			ctx,
 			func(ctx context.Context) {
-				var err error
-				s[i], err = mut(ctx, s[i])
+				key, val, err := mut(ctx, k, v)
 				if err != nil {
 					applyErr(&ptr, err)
+					return
 				}
+				m[key] = val
 			},
 			subOpts...,
 		)
@@ -60,6 +63,7 @@ func Slice[T any](ctx context.Context, s []T, mut Mutator[T, T], p goroutines.Po
 			return err
 		}
 	}
+
 	p.Wait()
 
 	errPtr := ptr.Load()
@@ -70,19 +74,17 @@ func Slice[T any](ctx context.Context, s []T, mut Mutator[T, T], p goroutines.Po
 	return nil
 }
 
-// ResultSlice takes values in slice "s" and applies Mutator "m" to get a new result slice []R.
-// Slice "s" is not mutated. This allows you to have a returns slice of a different type or
-// simply to leave the passed slice untouched.
-// Errors will be returned, but will not stop this from completing. Values at the
-// position that return an error will be the zero value for the R type.
-func ResultSlice[T, R any](ctx context.Context, s []T, mut Mutator[T, R], p goroutines.Pool, subOpts ...goroutines.SubmitOption) ([]R, error) {
+// ResultMap takes values in map "m" and applies Mutator "mut" to get a new result map[K]V.
+// Map "m" is not mutated.
+// Errors will be returned, but will not stop this from completing.
+func ResultMap[K comparable, V any](ctx context.Context, m map[K]V, mut MapMutator[K, V], p goroutines.Pool, subOpts ...goroutines.SubmitOption) (map[K]V, error) {
 	spanner := span.Get(ctx)
 
-	if len(s) == 0 {
-		if s == nil {
+	if len(m) == 0 {
+		if m == nil {
 			return nil, nil
 		}
-		return []R{}, nil
+		return map[K]V{}, nil
 	}
 
 	if p == nil {
@@ -96,9 +98,10 @@ func ResultSlice[T, R any](ctx context.Context, s []T, mut Mutator[T, R], p goro
 	}
 
 	ptr := atomic.Pointer[error]{}
-	results := make([]R, len(s))
-	for i := 0; i < len(s); i++ {
-		i := i
+	results := make(map[K]V, len(m))
+	for k, v := range m {
+		k := k
+		v := v
 
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -108,10 +111,12 @@ func ResultSlice[T, R any](ctx context.Context, s []T, mut Mutator[T, R], p goro
 			ctx,
 			func(ctx context.Context) {
 				var err error
-				results[i], err = mut(ctx, s[i])
+				key, val, err := mut(ctx, k, v)
 				if err != nil {
 					applyErr(&ptr, err)
+					return
 				}
+				results[key] = val
 			},
 			subOpts...,
 		)
@@ -124,23 +129,4 @@ func ResultSlice[T, R any](ctx context.Context, s []T, mut Mutator[T, R], p goro
 		return results, *errPtr
 	}
 	return results, nil
-}
-
-func applyErr(ptr *atomic.Pointer[error], err error) {
-	for {
-		existing := ptr.Load()
-		if existing == nil {
-			if ptr.CompareAndSwap(nil, &err) {
-				return
-			}
-		} else {
-			if err == context.Canceled {
-				return
-			}
-			err = fmt.Errorf("%w", err)
-			if ptr.CompareAndSwap(existing, &err) {
-				return
-			}
-		}
-	}
 }
