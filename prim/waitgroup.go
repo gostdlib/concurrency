@@ -33,6 +33,8 @@ type WaitGroup struct {
 	wg     sync.WaitGroup
 	// Pool is an optional goroutines.Pool for concurrency control and reuse.
 	Pool goroutines.Pool
+	// PoolOptions are the options to use when submitting jobs to the Pool.
+	PoolOptions []goroutines.SubmitOption
 	// CancelOnErr holds a CancelFunc that will be called if any goroutine
 	// returns an error. This will automatically be called when Wait() is
 	// finishecd and then reset to nil.
@@ -45,7 +47,7 @@ type WaitGroup struct {
 // Go spins off a goroutine that executes f(ctx). This will use the underlying
 // goroutines.Pool if provided. If you pass a goroutines.SubmitOption but have
 // not supplied a pool or the pool doesn't support the option, this may panic.
-func (w *WaitGroup) Go(ctx context.Context, f FuncCall, options ...goroutines.SubmitOption) {
+func (w *WaitGroup) Go(ctx context.Context, f FuncCall) {
 	w.count.Add(1)
 	w.total.Add(1)
 
@@ -85,7 +87,7 @@ func (w *WaitGroup) Go(ctx context.Context, f FuncCall, options ...goroutines.Su
 				}
 			}
 		},
-		options...,
+		w.PoolOptions...,
 	)
 }
 

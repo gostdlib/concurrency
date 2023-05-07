@@ -7,6 +7,7 @@ import (
 
 	"github.com/gostdlib/concurrency/goroutines"
 	"github.com/gostdlib/concurrency/goroutines/limited"
+	"github.com/johnsiilver/calloptions"
 )
 
 // StreamResult is a result from a Stream operation.
@@ -17,19 +18,34 @@ type StreamResult[T any] struct {
 	Err error
 }
 
-// Chan applies Mutator "mut" to each element in "input" using the goroutines Pool. If p == nil,
-// p becomes a limited.Pool using up to runtime.NumCPU().
+type chanOptions struct {
+	pool        goroutines.Pool
+	poolOptions []goroutines.SubmitOption
+}
+
+// ChanOption is an option for Chan().
+type ChanOption interface {
+	chanFunc()
+}
+
+// Chan applies Mutator "mut" to each element in "input" using the goroutines Pool. If WithPool() isn't provided,
+// we use a limited.Pool using up to runtime.NumCPU().
 // If the Mutator has an error, the error will be returned in the StreamResult but this will not stop
 // processing. If a subOpts is passed, it will be applied to each goroutine. If a subOpts causes an
 // error (because it is invalid), this will panic. You can cancel the context to stop processing.
-func Chan[T, R any](ctx context.Context, input chan T, mut Mutator[T, R], p goroutines.Pool, subOpts ...goroutines.SubmitOption) chan StreamResult[R] {
-	if p == nil {
+func Chan[T, R any](ctx context.Context, input chan T, mut Mutator[T, R], options ...ChanOption) (chan StreamResult[R], error) {
+	opts := &chanOptions{}
+	if err := calloptions.ApplyOptions(&opts, options); err != nil {
+		return nil, err
+	}
+
+	if opts.pool == nil {
 		var err error
-		p, err = limited.New("", runtime.NumCPU())
+		opts.pool, err = limited.New("", runtime.NumCPU())
 		if err != nil {
 			panic(err) // This should never happen.
 		}
-		defer p.Close()
+		defer opts.pool.Close()
 	}
 
 	out := make(chan StreamResult[R], 1)
@@ -55,7 +71,7 @@ func Chan[T, R any](ctx context.Context, input chan T, mut Mutator[T, R], p goro
 			}
 
 			wg.Add(1)
-			err := p.Submit(
+			err := opts.pool.Submit(
 				ctx,
 				func(ctx context.Context) {
 					defer wg.Done()
@@ -67,12 +83,12 @@ func Chan[T, R any](ctx context.Context, input chan T, mut Mutator[T, R], p goro
 					}
 					out <- StreamResult[R]{Value: r}
 				},
-				subOpts...,
+				opts.poolOptions...,
 			)
 			if err != nil {
 				panic(err)
 			}
 		}
 	}()
-	return out
+	return out, nil
 }

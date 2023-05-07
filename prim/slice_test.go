@@ -42,7 +42,7 @@ func TestSlice(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		err := Slice(ctx, test.s, test.m, nil)
+		err := Slice(ctx, test.s, test.m)
 		switch {
 		case err == nil && test.err:
 			t.Errorf("TestSlice(%s): want err != nil, got err == nil", test.desc)
@@ -94,7 +94,7 @@ func TestResultSlice(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		got, err := ResultSlice(ctx, test.s, test.m, nil)
+		got, err := ResultSlice(ctx, test.s, test.m)
 		switch {
 		case err == nil && test.err:
 			t.Errorf("TestResultSlice(%s): want err != nil, got err == nil", test.desc)

@@ -3,6 +3,13 @@ Package goroutines provides the interfaces and defintions that goroutine pools m
 implement/use. Implementations are in sub-directories and can be used directly
 without using this package.
 
+Pools are generally a low-level construct that are passed to higher level constructs that provide
+safety and more targeted functionality. The prim package is a good example of this. There you will
+find an enhanced WaitGroup, functions for processing slices in parallel, map processing and more.
+
+If you are looking to create pipelines, the pipeline package provides concurrent and parallel processing
+that will be more beneficial that trying to use pools directly.
+
 As this is the parent package, we will show some basic examples that are valid across
 all implementations using the "pooled" sub-package that implements the Pool interface found here.
 

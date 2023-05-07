@@ -18,7 +18,7 @@ func ExampleSlice() {
 
 	s := []int{1, 2, 3, 4, 5}
 
-	Slice(context.Background(), s, m, nil)
+	Slice(context.Background(), s, m)
 	fmt.Println(s)
 	// Output: [2 3 4 5 6]
 }
@@ -36,7 +36,7 @@ func ExampleResultSlice() {
 	}
 
 	s := []int{1, 2, 3, 4, 5}
-	r, _ := ResultSlice(context.Background(), s, m, nil)
+	r, _ := ResultSlice(context.Background(), s, m)
 	fmt.Println(r)
 	// Output: [Hello I am Macintosh ]
 }
