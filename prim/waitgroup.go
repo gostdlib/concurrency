@@ -39,7 +39,7 @@ type WaitGroup struct {
 	Pool goroutines.Pool
 	// CancelOnErr holds a CancelFunc that will be called if any goroutine
 	// returns an error. This will automatically be called when Wait() is
-	// finishecd and then reset to nil.
+	// finished and then reset to nil to allow reuse.
 	CancelOnErr context.CancelFunc
 	// Name provides an optional name for a WaitGroup for the purpose of
 	// OTEL logging information.
@@ -158,7 +158,8 @@ func applyErr(ptr *atomic.Pointer[error], err error) {
 				return
 			}
 		} else {
-			if err == context.Canceled {
+			switch err {
+			case context.Canceled, context.DeadlineExceeded:
 				return
 			}
 			err = fmt.Errorf("%w", err)

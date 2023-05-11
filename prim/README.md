@@ -19,11 +19,15 @@ go get github.com/gostdlib/concurrency/
     - Reuse and limiting of goroutines by supplying a [`goroutines.Pool`](https://pkg.go.dev/github.com/gostdlib/goroutiones#Pool)
     - Integration with logging of your choice, including support for OpenTelemetry spans
 - Use [`prim.Slice`](https://pkg.go.dev/github.com/gostdlib/prim#Slice) if you want:
+    - To access elements in a slice in parallel to perform some operation
+    - Support for processing errors
+    - Support for OpenTelemetry spans
+- Use [`prim.SliceMut`](https://pkg.go.dev/github.com/gostdlib/prim#Slice) if you want:
     - In place parallel processing of a slice of values
     - Support for processing errors
     - Support for OpenTelemetry spans
 - Use [`prim.ResultSlice`](https://pkg.go.dev/github.com/gostdlib/prim#Slice) if you want:
-    - To parallel process a slice of values and return an identical slice of values (not necessarily of the same type)
+    - To parallel process a slice of values and return a new slice of values based on the input slice(not necessarily of the same type)
     - Support for processing errors
     - Support for OpenTelemetry spans
 
@@ -78,7 +82,7 @@ func main() {
 
 ### Error capturing
 
-Old way that only gets the first error: 
+Old way to get an error: 
 ```go
 func main() {
     wg := sync.WaitGroup{}
