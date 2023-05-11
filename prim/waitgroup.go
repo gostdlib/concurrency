@@ -2,6 +2,7 @@ package prim
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,10 +32,11 @@ type WaitGroup struct {
 	total  atomic.Int64
 	errors atomic.Pointer[error]
 	wg     sync.WaitGroup
+
+	noCopy noCopy // Flag govet to prevent copying
+
 	// Pool is an optional goroutines.Pool for concurrency control and reuse.
 	Pool goroutines.Pool
-	// PoolOptions are the options to use when submitting jobs to the Pool.
-	PoolOptions []goroutines.SubmitOption
 	// CancelOnErr holds a CancelFunc that will be called if any goroutine
 	// returns an error. This will automatically be called when Wait() is
 	// finishecd and then reset to nil.
@@ -42,6 +44,8 @@ type WaitGroup struct {
 	// Name provides an optional name for a WaitGroup for the purpose of
 	// OTEL logging information.
 	Name string
+	// PoolOptions are the options to use when submitting jobs to the Pool.
+	PoolOptions []goroutines.SubmitOption
 }
 
 // Go spins off a goroutine that executes f(ctx). This will use the underlying
@@ -58,6 +62,7 @@ func (w *WaitGroup) Go(ctx context.Context, f FuncCall) {
 			defer w.wg.Done()
 
 			if ctx.Err() != nil {
+				applyErr(&w.errors, ctx.Err())
 				return
 			}
 
@@ -71,19 +76,22 @@ func (w *WaitGroup) Go(ctx context.Context, f FuncCall) {
 		return
 	}
 
+	w.wg.Add(1)
 	w.Pool.Submit(
 		ctx,
 		func(ctx context.Context) {
+			defer w.count.Add(-1)
+			defer w.wg.Done()
+
 			if ctx.Err() != nil {
+				applyErr(&w.errors, ctx.Err())
 				return
 			}
 
 			if err := f(ctx); err != nil {
-				if err := f(ctx); err != nil {
-					applyErr(&w.errors, err)
-					if w.CancelOnErr != nil {
-						w.CancelOnErr()
-					}
+				applyErr(&w.errors, err)
+				if w.CancelOnErr != nil {
+					w.CancelOnErr()
 				}
 			}
 		},
@@ -108,11 +116,8 @@ func (w *WaitGroup) Wait(ctx context.Context) error {
 	w.waitOTELStart(spanner)
 	defer w.waitOTELEnd(spanner, now)
 
-	if w.Pool == nil {
-		w.wg.Wait()
-	} else {
-		w.Pool.Wait()
-	}
+	w.wg.Wait()
+
 	if w.CancelOnErr != nil {
 		w.CancelOnErr()
 		w.CancelOnErr = nil
@@ -144,3 +149,26 @@ func (w *WaitGroup) waitOTELEnd(spanner span.Span, t time.Time) {
 	w.total.Store(0)
 	w.errors.Store(nil)
 }
+
+func applyErr(ptr *atomic.Pointer[error], err error) {
+	for {
+		existing := ptr.Load()
+		if existing == nil {
+			if ptr.CompareAndSwap(nil, &err) {
+				return
+			}
+		} else {
+			if err == context.Canceled {
+				return
+			}
+			err = fmt.Errorf("%w", err)
+			if ptr.CompareAndSwap(existing, &err) {
+				return
+			}
+		}
+	}
+}
+
+type noCopy struct{}
+
+func (*noCopy) Lock() {}

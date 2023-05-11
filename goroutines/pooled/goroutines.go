@@ -96,12 +96,6 @@ func (p *Pool) setName(name string) {
 	p.name = name
 }
 
-// setName sets the name of the goroutines pool. This is for internal use only.
-// This uses go:linkname, in the register package. Be SUPER CAREFUL on changing this.
-func setName(name string, p *Pool) {
-	p.setName(name)
-}
-
 type submit struct {
 	ctx context.Context
 	job goroutines.Job
@@ -110,12 +104,12 @@ type submit struct {
 // NonBlocking indicates that if a pooled goroutine is not available, spin off
 // a goroutine and do not block.
 func NonBlocking() goroutines.SubmitOption {
-	return func(opt *pool.SubmitOptions) error {
+	return func(opt pool.SubmitOptions) (pool.SubmitOptions, error) {
 		if opt.Type != pool.PTPooled {
-			return fmt.Errorf("cannot use pooled.NotBlocking() with a non pooled.Pool")
+			return opt, fmt.Errorf("cannot use pooled.NotBlocking() with a non pooled.Pool")
 		}
 		opt.NonBlocking = true
-		return nil
+		return opt, nil
 	}
 }
 
@@ -124,12 +118,12 @@ func NonBlocking() goroutines.SubmitOption {
 // way to get the name of function call reliably, as generic functions are written dynamically and
 // runtime.FuncForPC does not work for generics. If this is not set, we will use runtime.FuncForPC().
 func Caller(name string) goroutines.SubmitOption {
-	return func(opt *pool.SubmitOptions) error {
+	return func(opt pool.SubmitOptions) (pool.SubmitOptions, error) {
 		if opt.Type != pool.PTPooled {
-			return fmt.Errorf("cannot use pooled.NotBlocking() with a non pooled.Pool")
+			return opt, fmt.Errorf("cannot use pooled.NotBlocking() with a non pooled.Pool")
 		}
 		opt.Caller = name
-		return nil
+		return opt, nil
 	}
 }
 
@@ -144,9 +138,10 @@ func (p *Pool) Submit(ctx context.Context, runner goroutines.Job, options ...gor
 	}
 
 	opts := pool.SubmitOptions{Type: pool.PTPooled}
-
+	var err error
 	for _, o := range options {
-		if err := o(&opts); err != nil {
+		opts, err = o(opts)
+		if err != nil {
 			spanner.Error(err)
 			return err
 		}

@@ -10,7 +10,7 @@ import (
 	"github.com/gostdlib/concurrency/goroutines/pooled"
 )
 
-func ExampleSlice() {
+func ExampleSliceMut() {
 	// Take every integer in the slice and add 1 to it.
 	m := func(ctx context.Context, i int) (int, error) {
 		return i + 1, nil
@@ -18,7 +18,7 @@ func ExampleSlice() {
 
 	s := []int{1, 2, 3, 4, 5}
 
-	Slice(context.Background(), s, m)
+	SliceMut(context.Background(), s, m)
 	fmt.Println(s)
 	// Output: [2 3 4 5 6]
 }

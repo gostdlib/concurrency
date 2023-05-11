@@ -141,7 +141,7 @@ import (
 type Job func(ctx context.Context)
 
 // SubmitOption is an option for Pool.Submit().
-type SubmitOption func(opt *pool.SubmitOptions) error
+type SubmitOption func(opt pool.SubmitOptions) (pool.SubmitOptions, error)
 
 // Pool is the minimum interface that any goroutine pool must implement. This can
 // only be created by using a sub-package that implements this interface.

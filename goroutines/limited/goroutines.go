@@ -99,12 +99,12 @@ func (p *Pool) setName(name string) {
 // and it is not counted against the total. This is useful when you want to track
 // the statistics still but need this goroutine to run and don't want to do it naked.
 func NonBlocking() goroutines.SubmitOption {
-	return func(opt *pool.SubmitOptions) error {
+	return func(opt pool.SubmitOptions) (pool.SubmitOptions, error) {
 		if opt.Type != pool.PTLimited {
-			return fmt.Errorf("cannot use limited.NotBlocking() with a non limited.Pool")
+			return opt, fmt.Errorf("cannot use limited.NotBlocking() with a non limited.Pool")
 		}
 		opt.NonBlocking = true
-		return nil
+		return opt, nil
 	}
 }
 
@@ -113,12 +113,12 @@ func NonBlocking() goroutines.SubmitOption {
 // way to get the name of function call reliably, as generic functions are written dynamically and
 // runtime.FuncForPC does not work for generics. If this is not set, we will use runtime.FuncForPC().
 func Caller(name string) goroutines.SubmitOption {
-	return func(opt *pool.SubmitOptions) error {
+	return func(opt pool.SubmitOptions) (pool.SubmitOptions, error) {
 		if opt.Type != pool.PTLimited {
-			return fmt.Errorf("cannot use limited.NotBlocking() with a non limited.Pool")
+			return opt, fmt.Errorf("cannot use limited.NotBlocking() with a non limited.Pool")
 		}
 		opt.Caller = name
-		return nil
+		return opt, nil
 	}
 }
 
@@ -132,9 +132,10 @@ func (p *Pool) Submit(ctx context.Context, runner goroutines.Job, options ...gor
 	}
 
 	opts := pool.SubmitOptions{Type: pool.PTLimited}
-
+	var err error
 	for _, o := range options {
-		if err := o(&opts); err != nil {
+		opts, err = o(opts)
+		if err != nil {
 			spanner.Error(err)
 			return err
 		}

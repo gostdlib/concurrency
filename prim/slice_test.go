@@ -8,7 +8,7 @@ import (
 	"github.com/kylelemons/godebug/pretty"
 )
 
-func TestSlice(t *testing.T) {
+func TestSliceMut(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -42,7 +42,7 @@ func TestSlice(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		err := Slice(ctx, test.s, test.m)
+		err := SliceMut(ctx, test.s, test.m)
 		switch {
 		case err == nil && test.err:
 			t.Errorf("TestSlice(%s): want err != nil, got err == nil", test.desc)

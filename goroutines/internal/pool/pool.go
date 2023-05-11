@@ -20,7 +20,7 @@ type SubmitOptions struct {
 	Caller string
 	// Type is the type of pool this option is mean for.
 	Type PoolType
-	// NonBlocking indicates this call is non-blocking, which means if that the
+	// NonBlocking indicates this call is non-blocking, which means that if the
 	// pool does not have enough capacity it spins off a naked goroutine.
 	NonBlocking bool
 }
