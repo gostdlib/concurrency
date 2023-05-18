@@ -1,4 +1,4 @@
-package prim
+package wait
 
 import (
 	"context"
@@ -10,43 +10,12 @@ import (
 	"github.com/gostdlib/concurrency/goroutines/pooled"
 )
 
-func ExampleSliceMut() {
-	// Take every integer in the slice and add 1 to it.
-	m := func(ctx context.Context, i int) (int, error) {
-		return i + 1, nil
-	}
-
-	s := []int{1, 2, 3, 4, 5}
-
-	SliceMut(context.Background(), s, m)
-	fmt.Println(s)
-	// Output: [2 3 4 5 6]
-}
-
-func ExampleResultSlice() {
-	// Translates the slice integers into a slice of strings using the toWords map.
-	toWords := map[int]string{
-		1: "Hello",
-		2: "I",
-		3: "am",
-		4: "Macintosh",
-	}
-	m := func(ctx context.Context, i int) (string, error) {
-		return toWords[i], nil
-	}
-
-	s := []int{1, 2, 3, 4, 5}
-	r, _ := ResultSlice(context.Background(), s, m)
-	fmt.Println(r)
-	// Output: [Hello I am Macintosh ]
-}
-
 // JustErrors illustrates the use of WaitGroup in place of a sync.WaitGroup to
 // simplify goroutine counting and error handling. This example is derived from
 // This example is derived from errgroup.Group from golang.org/x/sync/errgroup.
-func ExampleWaitGroup_just_errors() {
+func ExampleGroup_just_errors() {
 	ctx := context.Background()
-	wg := WaitGroup{}
+	wg := Group{}
 
 	var urls = []string{
 		"http://www.golang.org/",
@@ -91,9 +60,9 @@ func fakeSearch(kind string) Search {
 // task: the "Google Search 2.0" function from
 // https://talks.golang.org/2012/concurrency.slide#46, augmented with a Context
 // and error-handling. // This example is derived from errgroup.Group from golang.org/x/sync/errgroup.
-func ExampleWaitGroup_parallel() {
+func ExampleGroup_parallel() {
 	Google := func(ctx context.Context, query string) ([]Result, error) {
-		wg := WaitGroup{}
+		wg := Group{}
 
 		searches := []Search{Web, Image, Video}
 		results := make([]Result, len(searches))
@@ -130,11 +99,11 @@ func ExampleWaitGroup_parallel() {
 
 // CancelOnErr illustrates how to use WaitGroup to do parallel tasks and
 // cancel all remaining tasks if a single task has an error.
-func ExampleWaitGroup_cancel_on_err() {
+func ExampleGroup_cancel_on_err() {
 	ctx, cancel := context.WithCancel(context.Background())
 	p, _ := pooled.New("poolName", 10)
 
-	wg := WaitGroup{Pool: p, CancelOnErr: cancel}
+	wg := Group{Pool: p, CancelOnErr: cancel}
 
 	for i := 0; i < 10000; i++ {
 		i := i

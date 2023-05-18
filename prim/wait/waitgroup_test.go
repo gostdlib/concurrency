@@ -1,4 +1,4 @@
-package prim
+package wait
 
 import (
 	"context"
@@ -35,7 +35,7 @@ func TestWaitGroupBasic(t *testing.T) {
 
 	for _, test := range tests {
 		// setup
-		var wg = WaitGroup{Pool: test.pool}
+		var wg = Group{Pool: test.pool}
 		var count atomic.Int32
 		var exit = make(chan struct{})
 
@@ -75,7 +75,7 @@ func TestWaitGroupBasic(t *testing.T) {
 func TestWaitGroupCancelOnErr(t *testing.T) {
 	// setup
 	ctx, cancel := context.WithCancel(context.Background())
-	wg := WaitGroup{CancelOnErr: cancel}
+	wg := Group{CancelOnErr: cancel}
 
 	// spin off 5 go routines
 	for i := 0; i < 5; i++ {

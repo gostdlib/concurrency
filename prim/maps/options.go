@@ -1,4 +1,4 @@
-package prim
+package maps
 
 import (
 	"fmt"
@@ -11,17 +11,17 @@ import (
 // this may not stop all operations. This can be used as a:
 // - SliceOption
 func WithStopOnErr() interface {
-	SliceOption
+	Option
 	calloptions.CallOption
 } {
 	return struct {
-		SliceOption
+		Option
 		calloptions.CallOption
 	}{
 		CallOption: calloptions.New(
 			func(a any) error {
 				switch t := a.(type) {
-				case *sliceOptions:
+				case *moptions:
 					t.stopOnErr = true
 					return nil
 				}
@@ -33,37 +33,20 @@ func WithStopOnErr() interface {
 
 // WithPool sets a goroutines.Pool and its submit options used in
 // a function call. This can be used as a:
-// - SliceOption
 // - MapOption
 // - ResultMapOption
-// - ChanOption
 func WithPoolOptions(pool goroutines.Pool, options ...goroutines.SubmitOption) interface {
-	SliceOption
-	MapOption
-	ResultMapOption
-	ChanOption
+	Option
 	calloptions.CallOption
 } {
 	return struct {
-		SliceOption
-		MapOption
-		ResultMapOption
-		ChanOption
+		Option
 		calloptions.CallOption
 	}{
 		CallOption: calloptions.New(
 			func(a any) error {
 				switch t := a.(type) {
-				case *sliceOptions:
-					t.poolOptions = options
-					return nil
-				case *mapOptions:
-					t.poolOptions = options
-					return nil
-				case *resultMapOptions:
-					t.poolOptions = options
-					return nil
-				case *chanOptions:
+				case *moptions:
 					t.poolOptions = options
 					return nil
 				}
