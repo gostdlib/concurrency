@@ -20,7 +20,7 @@ If used with `gostdlib/foundation/telemetry/slog`, OTEL traces will also contain
         - Reuse of goroutines instead of spawning new ones
         - The ability to limit the number of goroutines
         - The ability to bypass the goroutine limit for some tasks
-    - Use [`goroutines/limited](https://pkg.go.dev/github.com/gostdlib/goroutines/limited) if you want:
+    - Use [`goroutines/limited`](https://pkg.go.dev/github.com/gostdlib/goroutines/limited) if you want:
         - A safer way to spawn goroutines with limits
         - The ability to limit the number of goroutines
         - The ability to bypass the goroutine limit for some tasks
@@ -30,14 +30,10 @@ If used with `gostdlib/foundation/telemetry/slog`, OTEL traces will also contain
         - A parallel job runner that collects errors after all jobs complete
         - A parallel job runner that CAN stops processing on the first error
         - A parallel job runner that CAN be `Context` cancelled
-        - Reuse and limiting of goroutines by supplying a [`goroutines.Pool`](https://pkg.go.dev/github.com/gostdlib/goroutines#Pool)
+        - Reuse and limiting of goroutines by supplying a [`goroutines.Pool`](https://pkg.go.dev/github.com/gostdlib/concurrency/goroutines/#Pool)
         - Support for OpenTelemetry spans
     - Use [`prim/slices`](https://pkg.go.dev/github.com/gostdlib/concurrency/prim/slice#Access) if you want:
         - To access elements in a slice in parallel to perform some operation
-        - Support for processing errors
-        - Support for OpenTelemetry spans
-    - Use [`prim/maps`](https://pkg.go.dev/github.com/gostdlib/concurrency/prim/map#Access) if you want:
-        - In place parallel processing of a map of values
         - Support for processing errors
         - Support for OpenTelemetry spans
     - Use [`prim/chans`](https://pkg.go.dev/github.com/gostdlib/concurrency/prim/chans#Access) if you want:
