@@ -9,7 +9,7 @@ import (
 
 // WithStopOnErr causes the operation to stop if an error occurs. Since operations are parallel,
 // this may not stop all operations. This can be used as a:
-// - SliceOption
+// - Option
 func WithStopOnErr() interface {
 	Option
 	calloptions.CallOption

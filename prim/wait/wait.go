@@ -1,3 +1,26 @@
+/*
+Package wait provides a safer alternative to sync.WaitGroup. It is an alternative to the errgroup
+package, but does not implement streaming as that package can. We provide a better alternative to that
+in our stagepipe framework. 
+
+This package can leverage our groutines.Pool types for more control over concurrency and implements
+OTEL spans to record information around what is happening in your goroutines.
+
+Here is a basic example:
+
+	g := wait.Group{Name: "Print  me"}
+	
+	for i := 0; i < 100; i++ {
+		i := i 
+		g.Go(func(ctx context.Context) error{
+			fmt.Println(i)
+		}
+	}
+
+	if err := g.Wait(ctx); err != nil {
+		// Handle error
+	}
+*/
 package wait
 
 import (
@@ -16,11 +39,11 @@ import (
 type FuncCall func(ctx context.Context) error
 
 // Group provides a Group implementation that allows launching
-// goroutines in safer way by handling the .Add() and .Done() methods. This prevents
-// problems where you forget to increment or decrement the sync.Group. In
-// addition you can use a goroutines.Pool object to allow concurrency control
-// and goroutine reuse (if you don't, it just uses a goroutine per call).
-// It provides a Running() method that keeps track of
+// goroutines in safer way by handling the .Add() and .Done() methods in a standard
+// sync.WaitGroup. This prevents problems where you forget to increment or 
+// decrement the sync.WaitGroup. In addition you can use a goroutines.Pool object 
+// to allow concurrency control and goroutine reuse (if you don't, it just uses 
+// a goroutine per call). It provides a Running() method that keeps track of
 // how many goroutines are running. This can be used with the goroutines.Pool stats
 // to understand what goroutines are in use. It has a CancelOnErr() method to
 // allow mimicing of the golang.org/x/sync/errgroup package.
@@ -130,26 +153,36 @@ func (w *Group) Wait(ctx context.Context) error {
 	return nil
 }
 
+// waitOTELStart is called when Wait() is called and will log information to the span.
 func (w *Group) waitOTELStart(spanner span.Span) {
-	hasPool := w.Pool != nil
-	cancelOnErr := w.CancelOnErr != nil
+	if !spanner.Span.IsRecording() {
+		return
+	}
+
 	spanner.Event(
 		"WaitGroup.Wait() called",
 		"name", w.Name,
 		"total goroutines", w.total.Load(),
-		"cancelOnErr", cancelOnErr,
-		"using pool", hasPool,
+		"cancelOnErr", w.CancelOnErr != nil,
+		"using pool", w.Pool != nil,
 	)
 }
 
+// waitOTELEnd is called when Wait() is finished and will log information to the span.
 func (w *Group) waitOTELEnd(spanner span.Span, t time.Time) {
-	spanner.Event("WaitGroup(%s).Wait() done", "elapsed_ns", w.Name, time.Since(t))
+	if spanner.Span.IsRecording() {
+		spanner.Event("WaitGroup.Wait() done", "name", w.Name, "elapsed_ns", time.Since(t))
+	}
+
 	// Reset waitgroup counters.
 	w.count.Store(0)
 	w.total.Store(0)
 	w.errors.Store(nil)
 }
 
+// applyErr sets the error to be returned. If an error already exists, it wraps this error in that one.
+// If the error is some context cancellation, that is only recorded if it is the first error.
+// This uses atomic compare and swap operations to avoid mutex.
 func applyErr(ptr *atomic.Pointer[error], err error) {
 	for {
 		existing := ptr.Load()

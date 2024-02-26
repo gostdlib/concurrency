@@ -1,7 +1,6 @@
 # `wait`: A Safer WaitGroup for Production Applications
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/gostdlib/concurrency/concurrency.svg)](https://pkg.go.dev/github.com/gostdlib/concurrency/slices)
-[![Go Report Card](https://goreportcard.com/badge/github.com/gostdlib/concurrency)](https://goreportcard.com/report/github.com/gostdlib/concurrency)
+[![Go Reference](https://pkg.go.dev/badge/github.com/gostdlib/concurrency/concurrency.svg)](https://pkg.go.dev/github.com/gostdlib/concurrency/prim/wait)
 
 ## Introduction
 
@@ -57,7 +56,7 @@ In this code, there is a missing `defer wg.Done()` statement, leading to synchro
 ```go
 func main() {
     ctx := context.Background()
-    wg := prim.WaitGroup{}
+    wg := wait.Group{}
    
     for i := 0; i < 100; i++ {
         i := i
@@ -106,7 +105,7 @@ Using our error capturing
 
 ```go
 func main() {
-    wg := prim.WaitGroup{}
+    wg := wait.Group{}
 
     for i := 0; i < 100; i++ {
         i := i
@@ -169,7 +168,7 @@ With our `wait` package, you can limit the number of goroutines to the number of
 ```go
 func main() {
     p, _ := pooled.New(runtime.NumCPU()) // Reuse goroutines and limit their number.
-    wg := prim.WaitGroup{Pool: p}
+    wg := wait.Group{Pool: p}
 
     for i := 0; i < 100; i++ {
         i := i
@@ -191,7 +190,7 @@ func main() {
 
 ### Differences from `golang.org/x/errgroup`
 
-- Our package does not provide direct support for streaming. However, you can set up pipelines similar to `errgroup` using our `concurrency/pipelines` packages, which offer a more formal approach.
+- Our package does not provide direct support for streaming. However, you can set up pipelines similar to `errgroup` using our `concurrency/pipelines` packages, which offer a more formal approach. 
 
 ### Differences from `github.com/sourcegraph/conc`
 

@@ -1,0 +1,104 @@
+package main
+
+import (
+    "context"
+    "flag"
+    "fmt"
+    "log"
+    "runtime"
+
+    "github.com/gostdlib/concurrency/pipelines/stagedpipe"
+    "{{ .PackagePath }}"
+)
+
+var parallelism = runtime.NumCPU()
+
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	flag.Parse()
+
+	ctx := context.Background()
+    
+    // Create the StateMachine implementation that will be used in our pipeline.
+    xsm, err := {{ .PackageName }}.NewSM()
+    if err != nil {
+        log.Fatalf("cannot start state machine: %s", err)
+    }
+
+    // Create our parallel and concurrent Pipeline from our StateMachine.
+    pipeline, err := stagedpipe.New[{{ .PackageName }}.Data]("pipeline name", parallelism, xsm)
+    if err!= nil {
+        log.Fatalf("cannot create a pipeline: %s", err)
+    }
+    defer pipeline.Close()
+
+    // Setup a RequestGroup to send data on. RequestGroup(s) are considered individual
+    // sets of requests that enter into the same shared pipeline. You may have multiple
+    // RequestGroup(s) acting on a Pipeline at any time. In many cases like ETL pipelines, 
+    // only one is required.
+    rg := pipeline.NewRequestGroup()
+    reqCtx, reqCancel := context.WithCancel(ctx)
+    defer reqCancel()
+
+    // Get responses from the pipeline. Many times you do not need to do anything with the
+    // output other than check an error condition, as operations like database commits happened
+    // in the pipeline. Other times, such as when doing RPC streaming or responses you will
+    // want to retrieve the data and pass it back to the caller. Output is received in
+    // random order.
+    done := make(chan error, 1) // Signal that we've received all output.
+    go func() {
+        var err error
+        defer func() {
+            if err != nil {
+                done <- err
+            }
+            close(done)
+        }()
+    
+        for out := range rg.Out() {
+            if err != nil {
+                // There was an error and in basic code we often don't want to continue if there 
+                // was an error. However, we do need to drain all output when an error occurs.
+                continue
+            }
+            if out.Err != nil {
+                // Stop input and processing. This is not required, but in the most common cases
+                // we no longer want to process this request.
+                reqCancel() 
+                err = out.Err
+                continue
+            }
+            fmt.Println(out.Data.Item)
+        }
+    }()
+
+    // Send data into the pipeline. 
+    // While we are not doing it here, it is best practice 
+    // to send bulk entries into the pipeline, especially when doing uploads to databases.
+    // This allows you to send a database bulk update in whatever size you choose. Do 
+    // remember that if you do a bulk size of say 10,000 entries, and you have 10 stages
+    // with 20 parallelism, you can have 2,000,000 entries in memory at a time with 200
+    // concurrent attempts to publish (if publishing in a Stage) to the database at a time. 
+    for i := 0; i < 10; i++ {
+        if reqCtx.Err() != nil {
+            break
+        }
+        req := {{ .PackageName }}.NewRequest(reqCtx, {{ .PackageName }}.Data{Item: i})
+        if err := rg.Submit(req); err != nil {
+            log.Fatalf("problem submitting request to the pipeline: %s", err)
+            break
+        }
+    }
+    rg.Close()
+
+    // Wait for everything to finish.
+    pipelineErr := <- done
+    if pipelineErr == nil {
+        fmt.Println("pipeline ran successfully")
+        return
+    }
+    fmt.Println("pipeline had an error: ", pipelineErr)
+    
+}
+
+
