@@ -8,18 +8,18 @@ go get github.com/gostdlib/concurrency/
 
 # A quick look
 
-- Use [`prim/wait`](https://pkg.go.dev/github.com/gostdlib/prim/wait) if you want:
+- Use [`prim/wait`](https://pkg.go.dev/github.com/gostdlib/concurrency/prim/wait) if you want:
     - A safer version of `sync.WaitGroup` for parallel jobs
     - A parallel job runner that collects errors after all jobs complete
     - A parallel job runner that CAN stops processing on the first error
     - A parallel job runner that CAN be `Context` cancelled
-    - Reuse and limiting of goroutines by supplying a [`goroutines.Pool`](https://pkg.go.dev/github.com/gostdlib/goroutines#Pool)
+    - Reuse and limiting of goroutines by supplying a [`goroutines.Pool`](https://pkg.go.dev/github.com/gostdlib/concurrency/goroutines#Pool)
     - Integration with logging of your choice, including support for OpenTelemetry spans
-- Use [`prim/slice`](https://pkg.go.dev/github.com/gostdlib/prim/slice) if you want:
+- Use [`prim/slices`](https://pkg.go.dev/github.com/gostdlib/concurrency/prim/slices) if you want:
     - To access elements in a slice in parallel to perform some operation
     - Support for processing errors
     - Support for OpenTelemetry spans
-- Use [`prim/chans`](https://pkg.go.dev/github.com/gostdlib/prim/chans) if you want:
+- Use [`prim/chans`](https://pkg.go.dev/github.com/gostdlib/concurrency/prim/chans) if you want:
     - To access elements from a receive channel in parallel to perform some operation
     - Support for processing erors
     - Support for OpenTelemetry spans
