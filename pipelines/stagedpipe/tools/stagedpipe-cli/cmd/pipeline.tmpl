@@ -1,0 +1,41 @@
+package {{ .PackageName }}
+
+import (
+    "github.com/gostdlib/concurrency/pipelines/stagedpipe"
+)
+
+// SM implements stagedpipe.StateMachine. It holds all the states for the pipeline.
+type SM struct {
+    // Add your own shared attributes if required.
+    // These attributes must be thread-safe as they are shared between all goroutines.
+    // Use these lightly, as it is almost always better to attach to the Data object.
+}
+
+// NewSM creates a new stagepipe.StateMachine from SM. 
+// You can add your own arguments to NewSM().
+func NewSM() (*SM, error) {
+	sm := &SM{}
+	return sm, nil
+}
+
+// Start is the entry point (first stage) of the pipeline. Every stage that you add must
+// have the same signature and be public.
+// Note: It is best practice to not attempt concurrency within the Pipeline. This ends up
+// being not as efficient as dividing a concurrency step as a Stage and allowing the 
+// pipeline to handle it. It can also create a lot of excess goroutine churn.
+func (s *SM) Start(req stagedpipe.Request[Data]) stagedpipe.Request[Data] {
+    if req.Ctx.Err() != nil {
+        req.Err = req.Ctx.Err()
+        return req
+    }
+
+    // Set the next stage to execute in the pipeline. nil exits the pipeline.
+	req.Next = nil 
+	return req
+}
+
+// Close implements stagedpipe.StateMachine.Close(). This can be used to shut down shared
+// resources in SM.
+func (s *SM) Close() {
+    // Nothing to do here.
+}

@@ -1,0 +1,1 @@
+Note, this queue implemention works fine, but it is deprecated in this package.  Simply here until I find a better place to put it.

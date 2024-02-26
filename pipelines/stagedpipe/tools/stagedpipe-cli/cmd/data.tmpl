@@ -1,0 +1,22 @@
+package {{ .PackageName }}
+
+import (
+    "context"
+
+    "github.com/gostdlib/concurrency/pipelines/stagedpipe"
+)
+
+// Data is the data that is passed through the pipeline for a request.
+// Best practice is to send bulk data and not individual items.
+type Data struct {
+    // Item int is simply used for demonstration, replace with your own attributes.
+    Item int
+}
+
+// NewRequest returns a new stagedpipe.Request object for use in your pipeline.
+func NewRequest(ctx context.Context, data Data) stagedpipe.Request[Data] {
+    return stagedpipe.Request[Data] {
+        Ctx: ctx,
+        Data: data,
+    }
+}

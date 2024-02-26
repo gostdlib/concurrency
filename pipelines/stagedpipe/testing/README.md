@@ -1,0 +1,1 @@
+Directory simply holds things needed for tests or some experiments I am using to validate various assumptions.
