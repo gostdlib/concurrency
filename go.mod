@@ -48,7 +48,7 @@ require (
 	github.com/go-json-experiment/json v0.0.0-20231102232822-2e55bd4e08b0
 	github.com/goccy/go-json v0.10.2
 	github.com/google/uuid v1.6.0
-	github.com/gostdlib/internals v0.0.0-20230114061332-1aaf7fe407e0
+	github.com/gostdlib/internals v0.0.0-20240226213826-a7049b732c26
 	github.com/jackc/pgconn v1.14.1
 	github.com/jackc/pgx/v4 v4.18.1
 	github.com/jmoiron/sqlx v1.3.5
