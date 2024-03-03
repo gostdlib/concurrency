@@ -800,5 +800,5 @@ func numStages[T any](sm any) int {
 }
 
 func methodName(method any) string {
-	return runtime.FuncForPC(reflect.ValueOf(method).Pointer()).Name()
+	return strings.TrimSuffix(runtime.FuncForPC(reflect.ValueOf(method).Pointer()).Name(), "-fm")
 }

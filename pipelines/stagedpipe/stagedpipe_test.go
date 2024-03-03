@@ -1,4 +1,4 @@
-package stagedpipe_test
+package stagedpipe
 
 import (
 	"context"
@@ -11,11 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gostdlib/concurrency/pipelines/stagedpipe"
 	"github.com/gostdlib/concurrency/pipelines/stagedpipe/testing/client"
 )
 
-// SM implements stagedpipe.StateMachine.
+// SM implements StateMachine.
 type SM struct {
 	// idClient is a client for querying for information based on an ID.
 	idClient *client.ID
@@ -33,8 +32,8 @@ func NewSM(cli *client.ID) *SM {
 // been processed.
 func (s *SM) Close() {}
 
-// Start implements stagedpipe.StateMachine.Start().
-func (s *SM) Start(req stagedpipe.Request[[]client.Record]) stagedpipe.Request[[]client.Record] {
+// Start implements StateMachine.Start().
+func (s *SM) Start(req Request[[]client.Record]) Request[[]client.Record] {
 	// This trims any excess space off of some string attributes.
 	// Because "x" is not a pointer, x.recs are not pointers, I need
 	// to reassign the changed entry to x.recs[i] .
@@ -64,7 +63,7 @@ func (s *SM) Start(req stagedpipe.Request[[]client.Record]) stagedpipe.Request[[
 
 // IdVerifier takes a Request and adds it to a bulk request to be sent to the
 // identity service. This is the last stage of this pipeline.
-func (s *SM) IdVerifier(req stagedpipe.Request[[]client.Record]) stagedpipe.Request[[]client.Record] {
+func (s *SM) IdVerifier(req Request[[]client.Record]) Request[[]client.Record] {
 	ctx, cancel := context.WithTimeout(req.Ctx, 2*time.Second)
 	defer cancel()
 
@@ -101,8 +100,8 @@ func (g *gen) genRecord(n int, withErr bool) []client.Record {
 	return recs
 }
 
-func (g *gen) genRequests(n int) []stagedpipe.Request[[]client.Record] {
-	reqs := make([]stagedpipe.Request[[]client.Record], n)
+func (g *gen) genRequests(n int) []Request[[]client.Record] {
+	reqs := make([]Request[[]client.Record], n)
 
 	for i, req := range reqs {
 		withErr := false
@@ -129,7 +128,7 @@ func TestPipelines(t *testing.T) {
 
 	tests := []struct {
 		desc     string
-		requests []stagedpipe.Request[[]client.Record]
+		requests []Request[[]client.Record]
 		err      bool
 	}{
 		{
@@ -150,7 +149,7 @@ func TestPipelines(t *testing.T) {
 	}
 
 	sm := NewSM(&client.ID{})
-	p, err := stagedpipe.New("test statemachine", 10, stagedpipe.StateMachine[[]client.Record](sm))
+	p, err := New("test statemachine", 10, StateMachine[[]client.Record](sm))
 	if err != nil {
 		panic(err)
 	}
@@ -248,7 +247,7 @@ func BenchmarkPipeline(b *testing.B) {
 	reqs := gen.genRequests(100000)
 	sm := NewSM(&client.ID{})
 
-	p, err := stagedpipe.New("test", runtime.NumCPU(), stagedpipe.StateMachine[[]client.Record](sm))
+	p, err := New("test", runtime.NumCPU(), StateMachine[[]client.Record](sm))
 	if err != nil {
 		panic(err)
 	}
@@ -281,7 +280,7 @@ type DAGSM struct{}
 
 func (d *DAGSM) Close() {}
 
-func (d *DAGSM) Start(req stagedpipe.Request[DAGData]) stagedpipe.Request[DAGData] {
+func (d *DAGSM) Start(req Request[DAGData]) Request[DAGData] {
 	if req.Data.Num%2 == 0 {
 		req.Next = d.RouteBackToStart
 		return req
@@ -290,12 +289,12 @@ func (d *DAGSM) Start(req stagedpipe.Request[DAGData]) stagedpipe.Request[DAGDat
 	return req
 }
 
-func (d *DAGSM) RouteBackToStart(req stagedpipe.Request[DAGData]) stagedpipe.Request[DAGData] {
+func (d *DAGSM) RouteBackToStart(req Request[DAGData]) Request[DAGData] {
 	req.Next = d.Start
 	return req
 }
 
-func (d *DAGSM) End(req stagedpipe.Request[DAGData]) stagedpipe.Request[DAGData] {
+func (d *DAGSM) End(req Request[DAGData]) Request[DAGData] {
 	req.Next = nil
 	return req
 }
@@ -304,11 +303,11 @@ func TestDAG(t *testing.T) {
 	t.Parallel()
 
 	sm := &DAGSM{}
-	p, err := stagedpipe.New[DAGData](
+	p, err := New[DAGData](
 		"test statemachine",
 		10,
 		sm,
-		stagedpipe.DAG[DAGData](),
+		DAG[DAGData](),
 	)
 
 	if err != nil {
@@ -321,7 +320,7 @@ func TestDAG(t *testing.T) {
 	defer reqCancel()
 
 	done := make(chan error, 1)
-	got := []stagedpipe.Request[DAGData]{}
+	got := []Request[DAGData]{}
 
 	go func() {
 		defer close(done)
@@ -331,7 +330,7 @@ func TestDAG(t *testing.T) {
 		}
 	}()
 
-	requests := []stagedpipe.Request[DAGData]{
+	requests := []Request[DAGData]{
 		{Data: DAGData{Num: 0}},
 		{Data: DAGData{Num: 1}},
 		{Data: DAGData{Num: 2}},
@@ -375,9 +374,17 @@ func TestDAG(t *testing.T) {
 		}
 
 		if i%2 == 0 {
-			if !stagedpipe.IsErrCyclic(got[i].Err) {
+			if !IsErrCyclic(got[i].Err) {
 				t.Errorf("request %d, got %q, want a cyclic error", i, got[i].Err)
 			}
 		}
+	}
+}
+
+func TestMethodName(t *testing.T) {
+	sm := NewSM(&client.ID{})
+	mn := methodName(sm.Start)
+	if !strings.HasSuffix(mn, ".Start") {
+		t.Fatalf("TestMethodName: got %s, it to end with '.Start'", mn)
 	}
 }
