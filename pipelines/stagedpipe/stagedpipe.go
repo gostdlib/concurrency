@@ -217,7 +217,7 @@ func (r Request[T]) otelStart() Request[T] {
 
 	r.span.Event(
 		"processing start",
-		"data", *(*string)(unsafe.Pointer(&j)),
+		"data", *(*string)(unsafe.Pointer(&j)), // prevent a copy of the data.
 		"queue_wait_ns", time.Since(r.queueTime),
 	)
 	return r
@@ -225,7 +225,7 @@ func (r Request[T]) otelStart() Request[T] {
 
 /*
 Event records an OTEL event into the Request span with name and keyvalues. This allows for stages
-in your statemachine to record entry and exist through each stage. keyvalues must be an even number with every
+in your statemachine to record events inside each stage. keyvalues must be an even number with every
 even value a string representing the key, with the following value representing the value
 associated with that key. The following values are supported:
 
@@ -235,9 +235,6 @@ associated with that key. The following values are supported:
 - int64/[]int64
 - string/[]string
 - time.Duration/[]time.Duration
-
-Note: Because Go generics remove the ability to get function or method names at runtime, we cannot
-automatically record the stage name. You will need to do this manually if you want deep OTEL tracing.
 
 Note: This is a no-op if the Request is not recording.
 */
@@ -747,35 +744,57 @@ func (p *pipeline[T]) processReq(r Request[T]) Request[T] {
 	// which indicates that the statemachine is done processing.
 	stage := p.sm.Start
 	for {
-		// If the context has been cancelled, stop processing.
-		if r.Ctx.Err() != nil {
-			r.Err = r.Ctx.Err()
-			return r
-		}
-
-		if r.seenStages != nil {
-			if r.seenStages.seen(methodName(stage)) {
-				r.Err = Error{Type: cyclicErr, Msg: r.seenStages.callTrace()}
-				return r
-			}
-		}
-
-		for _, pp := range p.preProcessors {
-			r = pp(r)
-			if r.Err != nil {
-				return r
-			}
-		}
-		r = stage(r)
+		r = p.execStage(r, stage)
 		if r.Err != nil {
 			return r
 		}
 		stage = r.Next
+		r.Next = nil
 
 		if stage == nil {
 			return r
 		}
 	}
+}
+
+// execStage executes a single stage of the pipeline and all preProcessors. It also
+// creates a new span for the stage.
+func (p *pipeline[T]) execStage(r Request[T], stage Stage[T]) Request[T] {
+	stageName := methodName(stage)
+
+	parentCtx := r.Ctx
+	parentSpan := r.span
+	defer func() {
+		r.Ctx = parentCtx
+		r.span = parentSpan
+	}()
+	r.Ctx, r.span = span.New(r.Ctx, stageName)
+
+	r.Event(stageName, "start", time.Now())
+	defer func() {
+		r.Event(stageName, "end", time.Now())
+	}()
+
+	// If the context has been cancelled, stop processing.
+	if r.Ctx.Err() != nil {
+		r.Err = r.Ctx.Err()
+		return r
+	}
+
+	if r.seenStages != nil {
+		if r.seenStages.seen(methodName(stage)) {
+			r.Err = Error{Type: cyclicErr, Msg: r.seenStages.callTrace()}
+			return r
+		}
+	}
+
+	for _, pp := range p.preProcessors {
+		r = pp(r)
+		if r.Err != nil {
+			return r
+		}
+	}
+	return stage(r)
 }
 
 // calcExitStats calculates the final stats when a Request exits the Pipeline.
@@ -799,6 +818,16 @@ func numStages[T any](sm any) int {
 	return count
 }
 
+// methodName takes a function or a method and returns its name.
 func methodName(method any) string {
-	return strings.TrimSuffix(runtime.FuncForPC(reflect.ValueOf(method).Pointer()).Name(), "-fm")
+	if method == nil {
+		return "<nil>"
+	}
+	valueOf := reflect.ValueOf(method)
+	switch valueOf.Kind() {
+	case reflect.Func:
+		return strings.TrimSuffix(strings.TrimSuffix(runtime.FuncForPC(valueOf.Pointer()).Name(), "-fm"), "[...]")
+	default:
+		return "<not a function>"
+	}
 }
