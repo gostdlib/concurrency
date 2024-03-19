@@ -1,7 +1,7 @@
 /*
 Package wait provides a safer alternative to sync.WaitGroup. It is an alternative to the errgroup
 package, but does not implement streaming as that package can. We provide a better alternative to that
-in our stagepipe framework. 
+in our stagepipe framework.
 
 This package can leverage our groutines.Pool types for more control over concurrency and implements
 OTEL spans to record information around what is happening in your goroutines.
@@ -9,9 +9,9 @@ OTEL spans to record information around what is happening in your goroutines.
 Here is a basic example:
 
 	g := wait.Group{Name: "Print  me"}
-	
+
 	for i := 0; i < 100; i++ {
-		i := i 
+		i := i
 		g.Go(func(ctx context.Context) error{
 			fmt.Println(i)
 		}
@@ -32,17 +32,19 @@ import (
 
 	"github.com/gostdlib/concurrency/goroutines"
 	"github.com/gostdlib/internals/otel/span"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
-// FunCall is a function call that can be used in various functions or methods
+// FuncCall is a function call that can be used in various functions or methods
 // in this package.
 type FuncCall func(ctx context.Context) error
 
 // Group provides a Group implementation that allows launching
 // goroutines in safer way by handling the .Add() and .Done() methods in a standard
-// sync.WaitGroup. This prevents problems where you forget to increment or 
-// decrement the sync.WaitGroup. In addition you can use a goroutines.Pool object 
-// to allow concurrency control and goroutine reuse (if you don't, it just uses 
+// sync.WaitGroup. This prevents problems where you forget to increment or
+// decrement the sync.WaitGroup. In addition you can use a goroutines.Pool object
+// to allow concurrency control and goroutine reuse (if you don't, it just uses
 // a goroutine per call). It provides a Running() method that keeps track of
 // how many goroutines are running. This can be used with the goroutines.Pool stats
 // to understand what goroutines are in use. It has a CancelOnErr() method to
@@ -56,6 +58,10 @@ type Group struct {
 	errors atomic.Pointer[error]
 	wg     sync.WaitGroup
 
+	start    time.Time
+	otelOnce sync.Once
+	span     span.Span
+
 	noCopy noCopy // Flag govet to prevent copying
 
 	// Pool is an optional goroutines.Pool for concurrency control and reuse.
@@ -68,13 +74,49 @@ type Group struct {
 	// OTEL logging information.
 	Name string
 	// PoolOptions are the options to use when submitting jobs to the Pool.
+	// If you have set PoolOptions but have not supplied a pool or the pool
+	// doesn't support the option, the result is undefined.
 	PoolOptions []goroutines.SubmitOption
 }
 
+// reset resets various internal state of the Group to allow reuse.
+func (w *Group) reset() {
+	w.start = time.Time{}
+	w.otelOnce = sync.Once{}
+	w.count.Store(0)
+	w.total.Store(0)
+	w.errors.Store(nil)
+	w.CancelOnErr = nil
+}
+
 // Go spins off a goroutine that executes f(ctx). This will use the underlying
-// goroutines.Pool if provided. If you pass a goroutines.SubmitOption but have
-// not supplied a pool or the pool doesn't support the option, this may panic.
+// goroutines.Pool if provided. If you have set PoolOptions but have
+// not supplied a pool or the pool doesn't support the option, the result is
+// undefined.
 func (w *Group) Go(ctx context.Context, f FuncCall) {
+	w.otelOnce.Do(func() {
+		spanner := span.Get(ctx)
+		if spanner.IsRecording() {
+			if w.Name == "" {
+				w.Name = "unspecified"
+			}
+			w.start = time.Now().UTC()
+
+			ctx, w.span = span.New(ctx, fmt.Sprintf("wait(%s)", w.Name))
+			w.span.Event(
+				fmt.Sprintf("wait(%s) start", w.Name),
+				"name", w.Name,
+				"start", w.start,
+			)
+		}
+	})
+
+	t := time.Now().UTC()
+	if w.span.Span != nil {
+		w.span.Event("Go", "start", t)
+		trace.ContextWithSpan(ctx, w.span.Span)
+	}
+
 	w.count.Add(1)
 	w.total.Add(1)
 
@@ -129,16 +171,28 @@ func (w *Group) Running() int {
 
 // Wait blocks until all goroutines are finshed. The passed Context cannot be cancelled.
 func (w *Group) Wait(ctx context.Context) error {
+	defer w.reset()
+
 	if w.Name == "" {
 		w.Name = "unspecified"
 	}
 
 	// OTEL stuff.
-	now := time.Now()
-	spanner := span.Get(ctx)
-	w.waitOTELStart(spanner)
-	defer w.waitOTELEnd(spanner, now)
+	now := time.Now().UTC()
+	defer func() {
+		end := time.Now().UTC()
+		w.span.Event(
+			fmt.Sprintf("wait(%s) end", w.Name),
+			"name", w.Name,
+			"end", end.UTC(),
+			"elapsed_ns", end.Sub(now),
+		)
+	}()
 
+	w.waitOTELStart()
+	defer w.waitOTELEnd(now)
+
+	// Now do the actual waiting.
 	w.wg.Wait()
 
 	if w.CancelOnErr != nil {
@@ -147,37 +201,38 @@ func (w *Group) Wait(ctx context.Context) error {
 	}
 	err := w.errors.Load()
 	if err != nil {
-		spanner.Error(*err)
+		w.span.Error(*err)
 		return *err
 	}
 	return nil
 }
 
 // waitOTELStart is called when Wait() is called and will log information to the span.
-func (w *Group) waitOTELStart(spanner span.Span) {
-	if !spanner.Span.IsRecording() {
+func (w *Group) waitOTELStart() {
+	if !w.span.IsRecording() {
 		return
 	}
 
-	spanner.Event(
+	w.span.Event(
 		"WaitGroup.Wait() called",
 		"name", w.Name,
 		"total goroutines", w.total.Load(),
 		"cancelOnErr", w.CancelOnErr != nil,
 		"using pool", w.Pool != nil,
+		"start:", time.Now().UTC(),
 	)
 }
 
 // waitOTELEnd is called when Wait() is finished and will log information to the span.
-func (w *Group) waitOTELEnd(spanner span.Span, t time.Time) {
-	if spanner.Span.IsRecording() {
-		spanner.Event("WaitGroup.Wait() done", "name", w.Name, "elapsed_ns", time.Since(t))
+func (w *Group) waitOTELEnd(t time.Time) {
+	if w.span.IsRecording() {
+		w.span.Event(
+			"wait.Group.Wait() done",
+			"name", w.Name,
+			"end", t,
+			"elapsed_ns", time.Now().UTC().Sub(t),
+		)
 	}
-
-	// Reset waitgroup counters.
-	w.count.Store(0)
-	w.total.Store(0)
-	w.errors.Store(nil)
 }
 
 // applyErr sets the error to be returned. If an error already exists, it wraps this error in that one.

@@ -38,6 +38,8 @@ github.com/gostdlib/internals v0.0.0-20240226213826-a7049b732c26 h1:jZ8RVII4Prct
 github.com/gostdlib/internals v0.0.0-20240226213826-a7049b732c26/go.mod h1:6I+k3gGnSAg+3uYKO1oqlVREtYqqGOXISbcgrCRDuL4=
 github.com/gostdlib/internals v0.0.0-20240318134949-efd53e9c24b4 h1:zNY+rUPBIcQQvnVlNd6vvlhDktg7Zbqf9tuoIKptPv0=
 github.com/gostdlib/internals v0.0.0-20240318134949-efd53e9c24b4/go.mod h1:6I+k3gGnSAg+3uYKO1oqlVREtYqqGOXISbcgrCRDuL4=
+github.com/gostdlib/internals v0.0.0-20240318152631-7d405f0d6b08 h1:MAw81ABKDAIkvuwbUF9WtXUMcWinRe3fxT71DfK50Ro=
+github.com/gostdlib/internals v0.0.0-20240318152631-7d405f0d6b08/go.mod h1:6I+k3gGnSAg+3uYKO1oqlVREtYqqGOXISbcgrCRDuL4=
 github.com/hashicorp/hcl v1.0.0 h1:0Anlzjpi4vEasTeNFn2mLJgTSwt0+6sfsiTG8qcWGx4=
 github.com/hashicorp/hcl v1.0.0/go.mod h1:E5yfLk+7swimpb2L/Alb/PJmXilQ/rhwaUYs4T20WEQ=
 github.com/inconshreveable/mousetrap v1.1.0 h1:wN+x4NVGpMsO7ErUn/mUI3vEoE6Jt13X2s0bqwp9tc8=
