@@ -1,282 +1,378 @@
 /*
-Package foreach runs an operation for its side effects on every key/value pair in an iter.Seq2, in
-parallel. It is the parallel analog of a "for range" loop whose body returns only an error: it does NOT
-transform values or hand any back. The only thing returned is the combined error of the run.
+Package foreach runs a function over every key/value pair in an iter.Seq2 in parallel and streams the
+results back. It is the parallel analog of a "for range" loop whose body transforms each element: Item
+takes a sequence and an ItemFunc and returns a lazy iter.Seq2 yielding one stream.Result per input
+pair under that pair's key — the value the ItemFunc produced or the error it returned.
 
-foreach is useful when each value needs an expensive, independent side effect: writing to a database,
-calling an API, publishing to a queue, and so on. For cheap operations a plain "for" loop in a single
-goroutine will be faster, as the cost of parallelism will outweigh the gain.
+foreach is useful when each pair needs expensive, independent work: calling an API, reading a database,
+transforming a record. For cheap operations a plain "for" loop in a single goroutine will be faster, as
+the cost of parallelism will outweigh the gain.
 
-Item applies a Func to each key/value pair yielded by the input sequence. Any iter.Seq2 works — over a
-slice (stream.Slice, keyed by index), a map (stream.Map, keyed by key), or a channel (stream.Chan, keyed
-by receive index). The value is passed by copy, so mutating it inside Func is not observable to the
-caller unless the sequence yields a pointer or reference type (e.g. a *Record whose pointed-at struct
-Func mutates); because Funcs run concurrently, that is only safe when each item is independent and
-nothing else reads it during the pass. By default Item processes until the sequence is exhausted or the
-Context is cancelled, using the worker pool attached to the Context. Errors returned by the Func are
-collected and returned together (each wrapped in the final error) but do not stop processing unless
-WithStopOnErr is passed.
+Say you want to multiply a slice of numbers by 5 in parallel:
 
-Say you want to read numbers from a channel and print each multiplied by 5:
+	nums := []int{1, 2, 3, 4}
 
-	input := make(chan int, 1)
-	go func() {
-		defer close(input)
-		for i := 0; i < 1000; i++ {
-			input <- i
+	fn := func(ctx context.Context, _ int, i int) (int, error) {
+		return i * 5, nil
+	}
+
+	for k, resp := range foreach.Item(ctx, stream.Slice(nums), fn) {
+		if resp.Err != nil {
+			// Handle the error.
+			continue
 		}
-	}()
-
-	fn := func(ctx context.Context, _ int, i int) error {
-		fmt.Println(i * 5)
-		return nil
+		fmt.Println(k, resp.V)
 	}
 
-	if err := foreach.Item(ctx, stream.Chan(ctx, input), fn); err != nil {
-		// Do something.
-	}
+Item is lazy: no work starts until the returned sequence is ranged, and stopping the range early
+cancels the work that has not started while waiting for the work already dispatched — side effects of
+started ItemFuncs always happen before the range returns. Each range over the returned sequence
+processes the input again, so range it once. Any iter.Seq2 works as input — over a slice
+(stream.Slice, keyed by index), a map (stream.Map, keyed by key), or a channel (stream.Chan, keyed by
+receive index).
 
-Because no options were provided, this processes until the sequence is exhausted or the Context is
-cancelled and uses a worker pool with runtime.NumCPU() * 10 workers. Pass WithStopOnErr to cancel on the
-first error.
+By default responses arrive in completion order: whatever finishes first yields first, under its input
+key. Pass WithOrdered() to receive responses in input order instead; that holds completed later responses
+in memory until every earlier one has been yielded, and WithMaxHeld bounds how many are held by pausing
+dispatch until the consumer catches up. Without WithOrdered, WithMaxHeld sizes the delivery buffer.
 
-To get transformed results back out — the fan-out/fan-in pattern — pair Item with an Order: the Func
-Adds each result under its input key and a consumer ranges Order.All(), which streams the results in
-input order while processing is still running. See the example on Order.
+Errors do not stop processing: they arrive in-band as Response.Err and every other pair still yields a
+response. Pass WithStopOnErr to cancel the remaining work on the first error; every pair already
+dispatched still yields a Response (the error's own, completed values, or the cancellation error for
+pairs cut short), then the iteration ends. For side effects only, use an ItemFunc that returns a zero
+value (say struct{}) and check only Response.Err.
+
+Item runs the ItemFuncs on the worker pool attached to the Context. If the pool is unlimited, up to
+runtime.NumCPU() * 10 workers are used.
+
+Failures can retry with backpressure. WithGate takes a base/retry/exponential Backoff: a failed
+ItemFunc retries with it, and while any pair is retrying, dispatch of new pairs pauses — a dependency
+having a bad moment gets time to recover instead of more traffic. The first attempt of every pair runs
+ungated, an error wrapping ErrPermanent is never retried, and work already dispatched keeps running.
+The gate belongs to a single Item range; bound recovery with the Backoff's Policy or a ctx deadline.
+See the example on WithGate.
 */
 package foreach
 
 import (
+	"errors"
+	"fmt"
 	"iter"
 	"runtime"
-	"sync/atomic"
 
-	"github.com/gostdlib/base/concurrency/sync"
+	"github.com/gostdlib/base/concurrency/worker"
 	"github.com/gostdlib/base/context"
-	"github.com/gostdlib/base/values/generics/queue"
-	"github.com/gostdlib/internals/otel/span"
+	"github.com/gostdlib/base/retry/exponential"
+	"github.com/gostdlib/concurrency/patterns/stream"
 )
 
-// Func is called for its side effects on every key/value pair in the input sequence. It returns only an
-// error; any result must be produced as a side effect.
-type Func[K, V any] func(context.Context, K, V) error
+// ErrPermanent prevents a retry from happening when a call is wrapped in a retry from
+// base/retry/exponential. Errors that cannot succeed on a retry (option validation) wrap it. Usually
+// added to an existing error with fmt.Errorf("%w: %w", origErr, ErrPermanent).
+var ErrPermanent = exponential.ErrPermanent
 
-type opts struct {
+// ItemFunc transforms one key/value pair from the input sequence into a result. The value is passed by
+// copy, so mutating it is not observable to the caller unless the sequence yields a pointer or
+// reference type; because ItemFuncs run concurrently, that is only safe when each pair is independent.
+type ItemFunc[K, V, R any] func(ctx context.Context, k K, v V) (R, error)
+
+// options holds Item's settings, built by applying each Option over the zero defaults.
+type options struct {
+	// stopOnErr cancels the remaining work on the first ItemFunc error. Default false: errors arrive
+	// in-band and processing continues.
 	stopOnErr bool
+	// boff, when non-nil, retries a failed ItemFunc behind the gate. Default nil (no retries).
+	boff *exponential.Backoff
+	// gate is internal wiring, not an option: Item installs it when boff is set, and dispatch pauses
+	// while any pair is retrying under it.
+	gate *gate
+	// ordered yields responses in input order through the order engine. Default false (completion
+	// order through the delivery buffer).
+	ordered bool
+	// maxHeld bounds undelivered responses: the delivery buffer's capacity when unordered, the order
+	// engine's held bound when ordered. Default 0, resolved by held() to the worker count capped at
+	// maxHeldDefault.
+	maxHeld int
+	// orderWait is internal wiring, not an option: the ordered path installs it to block while the
+	// order engine holds too many undelivered responses.
+	orderWait func(ctx context.Context) error
 }
 
-// Option is an option for Item.
-type Option func(o opts) (opts, error)
+// resolveOptions applies opts in order over the zero defaults.
+func resolveOptions(opts []Option) (options, error) {
+	o := options{}
+	for _, opt := range opts {
+		var err error
+		o, err = opt(o)
+		if err != nil {
+			return o, err
+		}
+	}
+	return o, nil
+}
 
-// WithStopOnErr causes the first error to cancel processing of the remaining values.
+// wait is Item's pre-dispatch checkpoint: it blocks until every configured pause condition (gate open,
+// order below its held bound) holds on a single pass. The gate is re-checked after an order wait, so a
+// retry that engages while dispatch is parked at a full order is honored before the next dispatch
+// instead of leaking one ItemFunc through the paused gate.
+func (o options) wait(ctx context.Context) error {
+	for {
+		if o.gate != nil {
+			if err := o.gate.wait(ctx); err != nil {
+				return err
+			}
+		}
+		if o.orderWait != nil {
+			if err := o.orderWait(ctx); err != nil {
+				return err
+			}
+		}
+		if o.gate == nil || o.orderWait == nil || o.gate.open() {
+			return nil
+		}
+	}
+}
+
+// maxHeldDefault caps the default held bound: without it, a service-wide pool Limited to a huge count
+// would make every Item call eagerly allocate a delivery buffer that size and couple its memory
+// behavior to a compute knob owned elsewhere.
+const maxHeldDefault = 1024
+
+// held resolves WithMaxHeld: the option's value when set, otherwise the pool's worker count capped at
+// maxHeldDefault.
+func (o options) held(p *worker.Pool) int {
+	if o.maxHeld > 0 {
+		return o.maxHeld
+	}
+	return min(p.Limit(), maxHeldDefault)
+}
+
+// Option is an option for Item. Options are applied in order, so a later option overrides an earlier
+// one; all options are optional, with zero values asking for the documented defaults.
+type Option func(o options) (options, error)
+
+// WithStopOnErr causes the first ItemFunc error to cancel processing of the remaining pairs. Every
+// pair already dispatched still yields a Response — the error's own, values that completed, and a
+// Response carrying the cancellation error for pairs that were cancelled before or while running;
+// pairs never dispatched yield nothing. A response is dropped only when the consumer abandons the
+// range by breaking out of it.
 func WithStopOnErr() Option {
-	return func(o opts) (opts, error) {
+	return func(o options) (options, error) {
 		o.stopOnErr = true
 		return o, nil
 	}
 }
 
-// Item runs fn for its side effects on each key/value pair yielded by seq, using the worker pool attached
-// to ctx. It returns no values, only the combined error. Adapt a channel, slice, or map into seq with
-// stream.Chan, stream.Slice, or stream.Map. If the pool is unlimited, up to runtime.NumCPU() * 10 workers are
-// used. Errors returned by fn are collected and returned together (each wrapped in the final error) but
-// do not stop processing unless WithStopOnErr is provided. Cancel ctx to stop early. A nil sequence is a
-// no-op.
-func Item[K, V any](ctx context.Context, seq iter.Seq2[K, V], fn Func[K, V], options ...Option) error {
-	spanner := span.Get(ctx)
-
-	if seq == nil {
-		return nil
+// WithGate makes Item retry a failed ItemFunc with boff behind an internal gate. The first attempt of
+// every pair runs ungated, but once an attempt fails with a retryable error, that pair retries under
+// boff while the gate pauses dispatch of new pairs — a dependency having a bad moment gets time to
+// recover instead of more traffic. Several retrying pairs keep the gate closed until the last one
+// resolves; work already dispatched is unaffected. An ItemFunc error wrapping ErrPermanent is never
+// retried, and a retrying ItemFunc should honor its Context so cancellation can end the retry.
+//
+// boff must be constructed with exponential.New (a zero-value Backoff retries in a zero-delay loop
+// with no bound), and retries run until the error resolves, is classified permanent, or ctx ends —
+// against a dependency that never recovers, bound the recovery with the Policy's MaxAttempts or a ctx
+// deadline or the gate stays closed and the range does not finish. The gate belongs to one Item range
+// and engages only on ItemFunc errors: concurrent Item calls against the same dependency gate
+// independently, so shared protection needs a shared Limited pool instead. A nil boff is an error.
+func WithGate(boff *exponential.Backoff) Option {
+	return func(o options) (options, error) {
+		if boff == nil {
+			return o, fmt.Errorf("foreach.WithGate: boff cannot be nil: %w", ErrPermanent)
+		}
+		o.boff = boff
+		return o, nil
 	}
+}
 
-	o := opts{}
-	var err error
-	for _, opt := range options {
-		o, err = opt(o)
-		if err != nil {
-			return err
+// WithOrdered makes Item yield responses in input order instead of completion order. A response is
+// held until every earlier pair's response has been yielded, so one slow pair causes completed later
+// responses to accumulate in memory; WithMaxHeld bounds that accumulation by pausing dispatch.
+func WithOrdered() Option {
+	return func(o options) (options, error) {
+		o.ordered = true
+		return o, nil
+	}
+}
+
+// WithMaxHeld bounds how many undelivered responses Item holds: with WithOrdered it pauses dispatch
+// of new work at the bound, resuming as the consumer drains; without it, it sizes the delivery
+// buffer, so workers block on delivery when the consumer lags. The ordered bound is approximate:
+// ItemFuncs already in flight can still deliver, so up to max plus the pool size may be held.
+// Defaults to the worker count, capped at 1024; max must be > 0.
+func WithMaxHeld(max int) Option {
+	return func(o options) (options, error) {
+		if max < 1 {
+			return o, fmt.Errorf("foreach.WithMaxHeld: max must be > 0, got %d: %w", max, ErrPermanent)
+		}
+		o.maxHeld = max
+		return o, nil
+	}
+}
+
+// keyed carries a pair's input key alongside its response from the workers to the consumer.
+type keyed[K, R any] struct {
+	k    K
+	resp stream.Result[R]
+}
+
+// Item runs fn on every key/value pair yielded by seq, in parallel on the worker pool attached to ctx,
+// and returns a lazy iterator that yields one stream.Result per pair under the pair's input key —
+// fn's value or its error. No work starts until the returned sequence is ranged, and ranging again
+// processes the input again. Adapt a channel, slice, or map into seq with stream.Chan, stream.Slice,
+// or stream.Map. A nil in or fn panics (those adapters yield a non-nil empty iterator, so an empty
+// input yields nothing without a nil seq). If an option is invalid, the sequence yields a single
+// Response whose Err reports it (wrapping ErrPermanent) under K's zero value.
+//
+// Stopping the range early (or cancelling ctx) cancels the work that has not started, and returning
+// from the range — normally or by breaking — waits for the ItemFuncs already dispatched to finish, so
+// their side effects happen before the range returns. If ctx is cancelled, every pair already
+// dispatched still yields a Response (values that completed, or the cancellation error for pairs cut
+// short), but pairs never dispatched yield nothing — check ctx.Err() after the range to distinguish a
+// truncated run from a complete one. A sequence blocked on an
+// external source (stream.Chan on an idle channel) is released only by its source or the Context the
+// sequence captured; Item pulls it on a separate goroutine so an early break still returns promptly,
+// but that puller parks until the source unblocks and at most one pulled pair is discarded. Calling
+// Item from inside an ItemFunc on a Limited pool can deadlock when the outer calls hold every slot —
+// nested parallelism needs a pool sized for both levels.
+func Item[K, V, R any](ctx context.Context, in iter.Seq2[K, V], fn ItemFunc[K, V, R], options ...Option) iter.Seq2[K, stream.Result[R]] {
+	if in == nil {
+		panic("foreach.Item: in cannot be nil")
+	}
+	if fn == nil {
+		panic("foreach.Item: fn cannot be nil")
+	}
+	o, err := resolveOptions(options)
+	if err != nil {
+		return func(yield func(K, stream.Result[R]) bool) {
+			var zero K
+			yield(zero, stream.Result[R]{Err: err})
 		}
 	}
+	if o.ordered {
+		return orderedSeq(ctx, in, fn, o)
+	}
+	return unorderedSeq(ctx, in, fn, o)
+}
 
+// pool returns the Context's worker pool, bounded to runtime.NumCPU() * 10 workers when unlimited.
+func pool(ctx context.Context) *worker.Pool {
 	p := context.Pool(ctx)
 	if p.Limit() == 0 {
 		p = p.Limited(ctx, "", runtime.NumCPU()*(10))
 	}
+	return p
+}
 
-	cancel := func() {}
-	if o.stopOnErr {
-		ctx, cancel = context.WithCancel(ctx)
-	}
-	g := p.Group()
-	g.CancelOnErr = cancel
+// input carries one pair from the puller to the dispatch loop.
+type input[K, V any] struct {
+	k K
+	v V
+}
 
-	for k, v := range seq {
-		if ctx.Err() != nil {
-			break
+// unorderedSeq streams responses in completion order through a bounded channel; the channel is the
+// backpressure, so no order engine or checkpoint is involved.
+func unorderedSeq[K, V, R any](ctx context.Context, seq iter.Seq2[K, V], fn ItemFunc[K, V, R], o options) iter.Seq2[K, stream.Result[R]] {
+	return func(yield func(K, stream.Result[R]) bool) {
+		// Every range gets its own copy of the resolved options and its own wiring (the gate), so
+		// ranging the returned sequence again — even concurrently — shares nothing with a prior range.
+		o := o
+		if o.boff != nil {
+			o.gate = &gate{}
 		}
-		g.Go(ctx, func(ctx context.Context) error {
-			return fn(ctx, k, v)
-		})
-	}
-	if err := g.Wait(ctx); err != nil {
-		spanner.Error(err)
-		return err
-	}
-	return ctx.Err()
-}
 
-type item[V any] struct {
-	insertNum uint64
-	value     V
-}
+		ctx, cancel := context.WithCancel(ctx)
 
-// Order reorders values produced concurrently (usually by Funcs running under Item) back into input
-// order. Workers call Add with the value's key from the input sequence; a single consumer ranges All to
-// receive the values sorted by that key, each one streamed as soon as every earlier key has been yielded.
-// This lets foreach act as an order-retaining fan-out/fan-in: the Func does the parallel work and Adds
-// the result, while the consumer receives results in input order as they become ready.
-//
-// Keys must be unique, 0-based and dense, which is what stream.Chan, stream.Slice and stream.Seq yield.
-// Values are held until all earlier keys arrive, so a slow item causes completed later results to
-// accumulate in memory.
-type Order[V any] struct {
-	q         *queue.Queue[queue.Value[item[V]]]
-	next      uint64
-	added     chan struct{}
-	done      chan struct{}
-	closeOnce sync.Once
-	consuming atomic.Bool
-}
-
-// New creates a new Order for use with a Context.
-func New[V any](ctx context.Context) (*Order[V], error) {
-	backing, err := queue.NewBTreePriority[queue.Value[item[V]]]()
-	if err != nil {
-		return nil, err
-	}
-	// The queue must be unbounded: values arrive in completion order and are held until all earlier
-	// keys arrive, so any bound deadlocks once out-of-order values fill it.
-	q, err := queue.New[queue.Value[item[V]]](ctx, "", backing, queue.Unlimited)
-	if err != nil {
-		return nil, err
-	}
-	return &Order[V]{q: q, added: make(chan struct{}, 1), done: make(chan struct{})}, nil
-}
-
-func itemEqual[V any](a, b item[V]) bool {
-	return a.insertNum == b.insertNum
-}
-
-func itemHash[V any](a item[V]) uint64 {
-	return a.insertNum
-}
-
-func newValue[V any](insertNum uint64, v V) queue.Value[item[V]] {
-	it := item[V]{insertNum: insertNum, value: v}
-	return queue.Value[item[V]]{V: it, Equaler: itemEqual[V], Hasher: itemHash[V], P: insertNum}
-}
-
-// Close signals that no more values will be Added. All() drains the values still held and then stops.
-// Close is safe to call multiple times and from a different goroutine than Add or All. Calls to Add()
-// after Close will cause a panic.
-func (o *Order[V]) Close() {
-	o.closeOnce.Do(func() { close(o.done) })
-}
-
-func (o *Order[V]) closed() bool {
-	select {
-	case <-o.done:
-		return true
-	default:
-		return false
-	}
-}
-
-// Len returns the number of values held in Order that All() has not yet yielded.
-func (o *Order[V]) Len() int {
-	return int(o.q.Len())
-}
-
-// Add adds the value v under key k, which must be the value's key in the input sequence. Add is safe to
-// call from multiple goroutines. Calling Add after Close panics, as does a negative k.
-func (o *Order[V]) Add(ctx context.Context, k int, v V) {
-	if k < 0 {
-		panic("Order.Add() called with a negative key")
-	}
-	if o.closed() {
-		panic("cannot call Order.Add() after Close() has been called")
-	}
-	// The insert number is k+1 because the priority queue backing rejects priority 0.
-	val := newValue(uint64(k)+1, v)
-	if _, err := o.q.Push(context.WithoutCancel(ctx), []queue.Value[item[V]]{val}); err != nil {
-		// The queue is unbounded, in-memory and never closed, so Push cannot fail.
-		panic(err)
-	}
-	// Wake a consumer blocked in All(). The buffer of one coalesces signals; All() re-examines the
-	// queue after every wakeup, so a coalesced signal cannot strand a value.
-	select {
-	case o.added <- struct{}{}:
-	default:
-	}
-}
-
-// All yields the Added values in key order along with their keys, streaming each value as soon as every
-// earlier key has been yielded. It waits for missing keys until Close() is called; after Close the
-// values still held are drained (in key order, skipping keys that were never Added) and the iteration
-// stops. Cancelling ctx also stops the iteration. All supports a single consumer at a time: ranging a
-// second sequence while another is still being consumed panics. Once an iteration ends, All can be
-// ranged again.
-func (o *Order[V]) All(ctx context.Context) iter.Seq2[int, V] {
-	// Queue operations use a non-cancellable Context so a ctx cancellation ends the iteration at the
-	// checks below instead of surfacing as queue errors mid-operation.
-	qctx := context.WithoutCancel(ctx)
-	return func(yield func(int, V) bool) {
-		if !o.consuming.CompareAndSwap(false, true) {
-			panic("Order.All() is already being consumed; All() supports a single consumer at a time")
-		}
-		defer o.consuming.Store(false)
-		for {
-			if ctx.Err() != nil {
-				return
-			}
-			// closed is read before Peek: every Add happens before Close, so a false read here means
-			// any value racing with this Peek triggers another pass (wait returns at once via o.done).
-			closed := o.closed()
-			v, ok, err := o.q.Peek(qctx)
-			if err != nil {
-				return
-			}
-			if !ok {
-				if closed {
-					return
+		p := pool(ctx)
+		out := make(chan keyed[K, R], o.held(p))
+		// gone signals that the consumer abandoned the range: it is the only thing that may drop a
+		// delivered response. Cancellation alone must not — the consumer may still be draining.
+		gone := make(chan struct{})
+		d := &dispatcher[K, V, R]{
+			seq:     seq,
+			fn:      fn,
+			o:       o,
+			cancel:  cancel,
+			pull:    make(chan input[K, V]),
+			done:    make(chan struct{}),
+			workers: p,
+			deliver: func(_ int, k K, resp stream.Result[R]) {
+				select {
+				case out <- keyed[K, R]{k: k, resp: resp}:
+				case <-gone:
 				}
-				o.wait(ctx)
-				continue
-			}
-			// While open, wait for the next key so output retains input order. Once closed, missing
-			// keys can never arrive, so drain what remains (the backing keeps it sorted by key).
-			if !closed && v.V.insertNum > o.next+1 {
-				o.wait(ctx)
-				continue
-			}
-			if _, err := o.q.Pop(qctx, 1); err != nil {
-				return
-			}
-			if v.V.insertNum > o.next {
-				o.next = v.V.insertNum
-			}
-			if !yield(int(v.V.insertNum-1), v.V.value) {
+			},
+			finish: func() { close(out) },
+		}
+		d.launch(ctx, context.Tasks(ctx))
+		// The join: returning from the range — normally or by breaking — releases blocked senders,
+		// cancels remaining work and waits for the dispatched ItemFuncs to finish, so their side
+		// effects happen before the range returns.
+		defer func() {
+			close(gone)
+			cancel()
+			<-d.done
+		}()
+
+		for kv := range out {
+			if !yield(kv.k, kv.resp) {
 				return
 			}
 		}
 	}
 }
 
-// wait blocks until a value is Added, Close() is called or ctx is cancelled.
-func (o *Order[V]) wait(ctx context.Context) {
-	select {
-	case <-o.added:
-	case <-o.done:
-	case <-ctx.Done():
+// orderedSeq streams responses in input order through the order engine, keyed by the dispatch counter
+// so K stays fully generic. WithMaxHeld (or its worker-count default) pauses dispatch via the
+// checkpoint while the engine holds too many undelivered responses.
+func orderedSeq[K, V, R any](ctx context.Context, seq iter.Seq2[K, V], fn ItemFunc[K, V, R], o options) iter.Seq2[K, stream.Result[R]] {
+	return func(yield func(K, stream.Result[R]) bool) {
+		// Every range gets its own copy of the resolved options and its own wiring (gate, orderWait),
+		// so ranging the returned sequence again — even concurrently — shares nothing with a prior
+		// range.
+		o := o
+		if o.boff != nil {
+			o.gate = &gate{}
+		}
+
+		ctx, cancel := context.WithCancel(ctx)
+
+		p := pool(ctx)
+		ord := newOrder[keyed[K, R]]()
+		held := o.held(p)
+		o.orderWait = func(ctx context.Context) error { return ord.waitBelow(ctx, held) }
+		d := &dispatcher[K, V, R]{
+			seq:     seq,
+			fn:      fn,
+			o:       o,
+			cancel:  cancel,
+			pull:    make(chan input[K, V]),
+			done:    make(chan struct{}),
+			workers: p,
+			deliver: func(i int, k K, resp stream.Result[R]) {
+				ord.add(i, keyed[K, R]{k: k, resp: resp})
+			},
+			finish: ord.finish,
+		}
+		d.launch(ctx, context.Tasks(ctx))
+		// The join: returning from the range — normally or by breaking — cancels remaining work and
+		// waits for the dispatched ItemFuncs to finish, so their side effects happen before the range
+		// returns.
+		defer func() {
+			cancel()
+			<-d.done
+		}()
+
+		for _, kv := range ord.all(ctx) {
+			if !yield(kv.k, kv.resp) {
+				return
+			}
+		}
 	}
 }
+
+// errOrderFinished stops dispatch if waitBelow ever observes a finished order. The dispatcher is the
+// only finisher and finishes only after all in-flight work completes, so observing it means an
+// internal bug; returning an error just ends dispatch cleanly instead of hanging or panicking in add.
+var errOrderFinished = errors.New("foreach: internal order finished while dispatch was paused")

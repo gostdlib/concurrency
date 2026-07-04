@@ -59,19 +59,82 @@ func TestChan(t *testing.T) {
 	}
 }
 
-// TestChanCancel verifies Chan stops iterating when the Context is cancelled even though the channel is
-// idle (never sends, never closes). Without Context awareness this would block forever.
+// TestChanCancel verifies that when ctx is cancelled before ranging begins, Chan yields nothing and does
+// not consume from c. This covers an idle channel (never sends, never closes; without Context awareness
+// this would block forever) as well as a channel pre-filled with buffered values, which must be left
+// untouched because cancellation is checked before any receive.
 func TestChanCancel(t *testing.T) {
 	t.Parallel()
 
+	tests := []struct {
+		name     string
+		buffered []int // Values pre-filled into the channel before iteration begins.
+	}{
+		{
+			name:     "Success: idle channel yields nothing after ctx cancelled",
+			buffered: nil,
+		},
+		{
+			name:     "Success: buffered values are not consumed after ctx cancelled",
+			buffered: []int{1, 2, 3},
+		},
+	}
+
+	for _, test := range tests {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		ch := make(chan int, len(test.buffered))
+		for _, v := range test.buffered {
+			ch <- v
+		}
+
+		got := collect(Chan(ctx, ch))
+		if got != nil {
+			t.Errorf("TestChanCancel(%s): got %v, want no values after ctx cancelled", test.name, got)
+		}
+		if len(ch) != len(test.buffered) {
+			t.Errorf("TestChanCancel(%s): got %d buffered values remaining, want %d (Chan must not consume from c after cancellation)", test.name, len(ch), len(test.buffered))
+		}
+	}
+}
+
+// TestChanCancelDuringIteration verifies that cancelling ctx mid-iteration over a continuously-fed
+// channel terminates the iteration promptly rather than yielding unbounded values. The consumer cancels
+// from inside the range body after a fixed number of values; because Chan checks ctx.Err() at the top of
+// every iteration, the loop must stop immediately, yielding exactly that many values. This is
+// deterministic (no timing) and stable under -race -count=50.
+func TestChanCancelDuringIteration(t *testing.T) {
+	t.Parallel()
+
 	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
+	defer cancel()
 
-	ch := make(chan int) // Never written to or closed.
+	ch := make(chan int) // Unbuffered so the producer only advances as the consumer receives.
 
-	got := collect(Chan(ctx, ch))
-	if got != nil {
-		t.Errorf("TestChanCancel: got %v, want no values after ctx cancelled", got)
+	// Producer feeds continuously until ctx is cancelled, so it never leaks past the test.
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case ch <- i:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	const cancelAfter = 5
+
+	var got []int
+	for _, v := range Chan(ctx, ch) {
+		got = append(got, v)
+		if len(got) == cancelAfter {
+			cancel()
+		}
+	}
+
+	if len(got) != cancelAfter {
+		t.Errorf("TestChanCancelDuringIteration: got %d values, want exactly %d (iteration must stop promptly after cancel)", len(got), cancelAfter)
 	}
 }
 

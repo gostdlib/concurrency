@@ -21,11 +21,11 @@ In addition, these packages integrate with OpenTelemetry (OTEL) and provide exec
         - Side effects (like database writes) that happen atomically with the in-memory change via accept functions
         - Built-in exponential backoff retries, with `ErrPermanent` to stop retrying
     - Use [`patterns/stream`](https://pkg.go.dev/github.com/gostdlib/concurrency/patterns/stream) and [`patterns/stream/foreach`](https://pkg.go.dev/github.com/gostdlib/concurrency/patterns/stream/foreach) if you want:
-        - A parallel `for range` over any `iter.Seq2` — running a side-effecting operation on every key/value pair
+        - A parallel `for range` over any `iter.Seq2` — `foreach.Item` runs a function on every key/value pair and streams each result back as a `stream.Result`
         - Adapters that bridge channels, slices, maps and `iter.Seq` into an `iter.Seq2` (`stream.Chan`, `stream.Slice`, `stream.Map`, `stream.Seq`)
-        - Deadlock-free fan-out/fan-in: pair `foreach.Item` with `foreach.Order` to process in parallel and stream the results back out in input order
-        - Errors collected across the run, or cancellation on the first error with `WithStopOnErr`
-        - Support for OpenTelemetry spans
+        - Deadlock-free fan-out/fan-in: results arrive in completion order, or in input order with `foreach.WithOrdered` (bounded by `WithMaxHeld`)
+        - Errors delivered in-band per pair, or cancellation on the first error with `WithStopOnErr`
+        - Built-in retries with backpressure: `foreach.WithGate(backoff)` retries failed calls while pausing dispatch so a sick dependency is not piled on, and support for OpenTelemetry spans
 - `pipelines/` : A set of packages for creating streaming pipelines
     - Use [`pipelines/stagedpipe`](https://pkg.go.dev/github.com/gostdlib/concurrency/pipelines/stagedpipe) if you want:
         - A safer way to build streaming pipelines
