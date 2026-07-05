@@ -25,7 +25,7 @@ stream.Slice, or stream.Map. It returns a channel that is closed once every pair
 
 The Worker error is not streamed back to the caller; it is only consumed by foreach's retry/stop-on-err
 options passed through as Option (WithGate to retry a flaky Worker, WithStopOnErr to cancel the run on
-the first error). Options that shape result delivery (WithOrdered) have no effect here because fanout
+the first error). Options that shape result delivery (WithOrdered) are not exposed, since fanout
 delivers no results.
 */
 package fanout
@@ -46,24 +46,31 @@ import (
 // WithStopOnErr cancels the remaining work on it); without those options the error is dropped.
 type Worker[K, V any] func(ctx context.Context, k K, v V) error
 
-// Option configures a Limited run. It is an alias for foreach's Option, since fanout is implemented on
-// foreach, but only the options that affect side-effect work are re-exported here: WithStopOnErr and
-// WithGate. foreach's result-delivery options (WithOrdered, WithMaxHeld) still type-check but do
-// nothing, because fanout delivers no results.
-type Option = foreach.Option
+// Option configures a Limited run. Only the options that affect side-effect work are exposed:
+// WithStopOnErr and WithGate. Option is a distinct type rather than an alias of foreach.Option on
+// purpose — foreach's result-delivery options (WithOrdered, WithMaxHeld) cannot be passed here, so an
+// unsupported option whose validation error fanout would silently drop can never reach the run.
+type Option func() (foreach.Option, error)
 
 // WithStopOnErr causes the first Worker error to cancel processing of the remaining pairs. Pairs
 // already dispatched still run to completion; done still closes once the run drains.
 func WithStopOnErr() Option {
-	return foreach.WithStopOnErr()
+	return func() (foreach.Option, error) {
+		return foreach.WithStopOnErr(), nil
+	}
 }
 
 // WithGate retries a failing Worker with boff behind an internal gate that pauses dispatch of new
 // pairs while any pair is retrying, so a struggling dependency gets time to recover instead of more
-// traffic. An error wrapping ErrPermanent is never retried, and a nil boff is an error surfaced when
-// the run starts. Build boff with exponential.New.
+// traffic. An error wrapping ErrPermanent is never retried; a nil boff panics. Build boff with
+// exponential.New.
 func WithGate(boff *exponential.Backoff) Option {
-	return foreach.WithGate(boff)
+	return func() (foreach.Option, error) {
+		if boff == nil {
+			return nil, fmt.Errorf("fanout.WithGate: boff cannot be nil: %w", ErrPermanent)
+		}
+		return foreach.WithGate(boff), nil
+	}
 }
 
 // ErrPermanent marks a Worker error that WithGate must never retry. Wrap it into an error that cannot
@@ -80,7 +87,7 @@ var ErrPermanent = foreach.ErrPermanent
 // instead of deadlocking. Cancelling ctx stops dispatch of pairs not yet started and lets the pairs
 // already dispatched drain; done still closes. If seq never ends — for example a stream.Chan whose
 // channel is never closed — the run never finishes and done never closes; the caller owns ending seq.
-func Limited[K, V any](ctx context.Context, name string, size int, seq iter.Seq2[K, V], w Worker[K, V], options ...Option) (done chan struct{}) {
+func Limited[K, V any](ctx context.Context, name string, size int, seq iter.Seq2[K, V], w Worker[K, V], options ...Option) (done <-chan struct{}) {
 	ctxLimit := context.Pool(ctx).Limit()
 	if size < 1 {
 		panic("fanout.Limited: cannot have a size < 1")
@@ -88,22 +95,41 @@ func Limited[K, V any](ctx context.Context, name string, size int, seq iter.Seq2
 	if ctxLimit != 0 && ctxLimit < size {
 		panic(fmt.Sprintf("fanout.Limited: size %d exceeds the Context pool's limit of %d", size, ctxLimit))
 	}
+	if w == nil {
+		panic("fanout.Limited: cannot have a nil Worker")
+	}
+	if seq == nil {
+		panic("fanout.Limited: cannot have a nil seq")
+	}
 
-	done = make(chan struct{})
+	opts := make([]foreach.Option, 0, len(options))
+	for _, o := range options {
+		if o == nil {
+			panic("fanout.Limited: cannot have a nil Option")
+		}
+		opt, err := o()
+		if err != nil {
+			panic(err)
+		}
+		opts = append(opts, opt)
+	}
+
+	d := make(chan struct{})
 	poolCtx := context.SetPool(ctx, context.Pool(ctx).Limited(ctx, name, size))
 	fn := func(ctx context.Context, k K, v V) (struct{}, error) {
 		return struct{}{}, w(ctx, k, v)
 	}
+
+	ctx = context.WithoutCancel(ctx)
 	// Drive the lazy foreach range on the unbounded default pool, discarding every Response since fanout
 	// has no output. The driver blocks on delivery, so keeping it off the Limited pool ensures it never
 	// consumes one of size's slots (a size-1 pool would otherwise deadlock against its own driver).
-	ok := worker.Default().Submit(ctx, func() {
-		for range foreach.Item(poolCtx, seq, fn, options...) {
+	// The driver runs on the WithoutCancel ctx so Submit never declines; that is what lets us drop the
+	// close-on-decline fallback and still guarantee done always closes.
+	_ = worker.Default().Submit(ctx, func() {
+		for range foreach.Item(poolCtx, seq, fn, opts...) {
 		}
-		close(done)
+		close(d)
 	})
-	if !ok {
-		close(done)
-	}
-	return done
+	return d
 }
