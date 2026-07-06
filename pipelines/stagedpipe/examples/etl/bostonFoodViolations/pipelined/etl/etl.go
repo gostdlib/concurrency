@@ -15,11 +15,12 @@ a network source that can send at speed and your writes are to a data store you 
 package etl
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/gostdlib/base/context"
 
 	"github.com/cenkalti/backoff"
 	"github.com/jackc/pgconn"

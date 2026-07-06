@@ -51,6 +51,7 @@ require (
 	github.com/spf13/cobra v1.8.1
 	github.com/spf13/viper v1.19.0
 	go.opentelemetry.io/otel v1.40.0
+	go.opentelemetry.io/otel/sdk v1.40.0
 )
 
 require (
@@ -115,7 +116,6 @@ require (
 	go.opentelemetry.io/otel/exporters/prometheus v0.59.1 // indirect
 	go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.37.0 // indirect
 	go.opentelemetry.io/otel/metric v1.40.0 // indirect
-	go.opentelemetry.io/otel/sdk v1.40.0 // indirect
 	go.opentelemetry.io/otel/sdk/metric v1.40.0 // indirect
 	go.opentelemetry.io/otel/trace v1.40.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.7.0 // indirect

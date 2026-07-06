@@ -3,12 +3,13 @@
 package client
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"strconv"
 	"sync/atomic"
 	"time"
+
+	"github.com/gostdlib/base/context"
 )
 
 var (

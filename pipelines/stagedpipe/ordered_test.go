@@ -1,10 +1,10 @@
 package stagedpipe_test
 
 import (
-	"context"
 	"log"
 	"testing"
 
+	"github.com/gostdlib/base/context"
 	"github.com/gostdlib/concurrency/pipelines/stagedpipe"
 )
 
@@ -59,7 +59,7 @@ func TestOrdered(t *testing.T) {
 	}
 
 	// Create our parallel and concurrent Pipeline from our StateMachine.
-	pipeline, err := stagedpipe.New[OrderedData]("ordered test", 10, xsm, stagedpipe.Ordered[OrderedData]())
+	pipeline, err := stagedpipe.New[OrderedData]("ordered test", 10, xsm, stagedpipe.WithOrdered())
 	if err != nil {
 		log.Fatalf("cannot create a pipeline: %s", err)
 	}

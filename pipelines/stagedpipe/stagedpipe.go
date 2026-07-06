@@ -72,7 +72,6 @@ Note: This package supports OTEL spans and will record information into OTEL spa
 package stagedpipe
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -82,13 +81,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/johnsiilver/dynamics/demux"
 	"github.com/johnsiilver/dynamics/method"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
-	"github.com/gostdlib/internals/otel/span"
+	"github.com/gostdlib/base/context"
+	"github.com/gostdlib/base/telemetry/otel/trace/span"
 
 	"github.com/go-json-experiment/json"
 )
@@ -114,13 +114,13 @@ func (e Error) Error() string {
 
 // IsErrCyclic returns true if the error is a cyclic error. A cyclic error is when
 // a stage is called more than once in a single Request. This is only returned
-// if the DAG() option is set.
+// if the WithDAG() option is set.
 func IsErrCyclic(err error) bool {
 	if err == nil {
 		return false
 	}
-	t, ok := err.(Error)
-	if !ok {
+	var t Error
+	if !errors.As(err, &t) {
 		return false
 	}
 	return t.Type == cyclicErr
@@ -165,10 +165,10 @@ func (s *seenStages) callTrace() string {
 	return out.String()
 }
 
-// reset resets the seenStages object to be reused.
+// reset truncates the seenStages object in place so it can be reused. It reuses the same
+// header the pool handed back rather than allocating a new one, which would defeat the pool.
 func (s *seenStages) reset() *seenStages {
-	n := (*s)[:0]
-	s = &n
+	*s = (*s)[:0]
 	return s
 }
 
@@ -206,7 +206,7 @@ type Request[T any] struct {
 }
 
 func (r Request[T]) otelStart() Request[T] {
-	if r.span.Span == nil || !r.span.Span.IsRecording() {
+	if !r.span.IsRecording() {
 		return r
 	}
 
@@ -217,36 +217,23 @@ func (r Request[T]) otelStart() Request[T] {
 
 	r.span.Event(
 		"processing start",
-		"data", *(*string)(unsafe.Pointer(&j)), // prevent a copy of the data.
-		"queue_wait_ns", time.Since(r.queueTime),
+		attribute.String("data", string(j)),
+		attribute.Int64("queue_wait_ns", int64(time.Since(r.queueTime))),
 	)
 	return r
 }
 
-/*
-Event records an OTEL event into the Request span with name and keyvalues. This allows for stages
-in your statemachine to record events inside each stage. keyvalues must be an even number with every
-even value a string representing the key, with the following value representing the value
-associated with that key. The following values are supported:
-
-- bool/[]bool
-- float64/[]float64
-- int/[]int
-- int64/[]int64
-- string/[]string
-- time.Duration/[]time.Duration
-
-Note: This is a no-op if the Request is not recording.
-*/
-func (r Request[T]) Event(name string, keyValues ...any) error {
-	if r.span.Span == nil || !r.span.Span.IsRecording() {
-		return nil
-	}
-	return r.span.Event(name, keyValues...)
+// Event records an OTEL event into the Request span with name and attrs. This allows stages in your
+// statemachine to record events inside each stage. Build attrs with the go.opentelemetry.io/otel/attribute
+// helpers, e.g. attribute.String("key", "value") or attribute.Int("count", 3).
+//
+// Note: This is a no-op if the Request is not recording.
+func (r Request[T]) Event(name string, attrs ...attribute.KeyValue) {
+	r.span.Event(name, attrs...)
 }
 
 func (r Request[T]) otelEnd() {
-	if r.span.Span == nil || !r.span.Span.IsRecording() {
+	if !r.span.IsRecording() {
 		return
 	}
 	if r.Err != nil {
@@ -258,8 +245,8 @@ func (r Request[T]) otelEnd() {
 	}
 	r.span.Event(
 		"processing end",
-		"data", *(*string)(unsafe.Pointer(&j)),
-		"elapsed_ns", time.Since(r.queueTime),
+		attribute.String("data", string(j)),
+		attribute.Int64("elapsed_ns", int64(time.Since(r.queueTime))),
 	)
 	r.span.End()
 }
@@ -308,70 +295,90 @@ type Pipelines[T any] struct {
 	demux *demux.Demux[uint64, Request[T]]
 
 	stats *stats
-	// ss is true if the DAG() option was set.
+	// ss is true if the WithDAG() option was set.
 	ss bool
-	// ordered is true if the Ordered() option was set.
+	// ordered is true if the WithOrdered() option was set.
 	ordered bool
 }
 
-// Option is an option for the New() constructor.
-type Option[T any] func(p *Pipelines[T]) error
+// pipelinesOptions holds the values set by the Option(s) passed to New(). It is type-erased
+// (Option is not generic), so preProcessors and subStageObjs are resolved against the concrete
+// T inside New().
+type pipelinesOptions struct {
+	// ss is true if the WithDAG() option was set.
+	ss bool
+	// ordered is true if the WithOrdered() option was set.
+	ordered bool
+	// preProcessors are PreProcessors for each stage. Each must be a PreProcesor[T] (or the
+	// equivalent func(Request[T]) Request[T]); New() type-asserts them once T is known.
+	preProcessors []any
+	// delayWarning is used to send a log message when pushing entries to the out channel
+	// takes longer than the supplied time.Duration.
+	delayWarning time.Duration
+	// subStageObjs holds objects whose Stage methods are counted toward concurrency but that
+	// do not live on the StateMachine. New() counts their stages once T is known.
+	subStageObjs []any
+}
 
-// DAG makes the StateMachine a Directed Acyllic Graph. This means that no Stage
+// Option is an option for the New() constructor. It is not generic, so a single set of Option
+// values can be passed to New() for any T; options that depend on T (WithPreProcessors,
+// WithCountSubStages) collect their arguments as any and are resolved inside New().
+type Option func(o pipelinesOptions) (pipelinesOptions, error)
+
+// WithDAG makes the StateMachine a Directed Acyllic Graph. This means that no Stage
 // can be called more than once in a single Request. If a Stage is called more than
 // once, the request will exit with a cyclic error that can be detected with IsErrCyclic().
-func DAG[T any]() Option[T] {
-	return func(p *Pipelines[T]) error {
-		p.ss = true
-		return nil
+func WithDAG() Option {
+	return func(o pipelinesOptions) (pipelinesOptions, error) {
+		o.ss = true
+		return o, nil
 	}
 }
 
-// Ordered makes the Pipelines output requests in the order they are received by a request group.
+// WithOrdered makes the Pipelines output requests in the order they are received by a request group.
 // This can slow down output as it stores finished requests until older ones finish processing
 // and are output.
-func Ordered[T any]() Option[T] {
-	return func(p *Pipelines[T]) error {
-		p.ordered = true
-		return nil
+func WithOrdered() Option {
+	return func(o pipelinesOptions) (pipelinesOptions, error) {
+		o.ordered = true
+		return o, nil
 	}
 }
 
-// PreProcessors provides a set of functions that are called in order
+// WithPreProcessors provides a set of functions that are called in order
 // at each stage in the StateMachine. This is used to do work that is common to
 // each stage instead of having to call the same code. Similar to http.HandleFunc
-// wrapping techniques.
-func PreProcessors[T any](p ...PreProcesor[T]) Option[T] {
-	return func(pipelines *Pipelines[T]) error {
-		pipelines.preProcessors = append(pipelines.preProcessors, p...)
-		return nil
+// wrapping techniques. Each argument must be a PreProcesor[T] (or the equivalent
+// func(Request[T]) Request[T]) for the T used in New(); New() returns an error if any is not.
+func WithPreProcessors(p ...any) Option {
+	return func(o pipelinesOptions) (pipelinesOptions, error) {
+		o.preProcessors = append(o.preProcessors, p...)
+		return o, nil
 	}
 }
 
-// DelayWarning will send a log message whenever pushing entries to the out channel
+// WithDelayWarning will send a log message whenever pushing entries to the out channel
 // takes longer than the supplied time.Duration. Not setting this results will result
 // in no warnings. Useful when chaining Pipelines and figuring out where something is stuck.
-func DelayWarning[T any](d time.Duration) Option[T] {
-	return func(pipelines *Pipelines[T]) error {
+func WithDelayWarning(d time.Duration) Option {
+	return func(o pipelinesOptions) (pipelinesOptions, error) {
 		if d < 0 {
-			return fmt.Errorf("cannot provide a DelayWarning < 0")
+			return o, fmt.Errorf("cannot provide a WithDelayWarning < 0")
 		}
-		pipelines.delayWarning = d
-		return nil
+		o.delayWarning = d
+		return o, nil
 	}
 }
 
-// CountSubStages is used when the StateMachine object does not hold all the Stage(s).
+// WithCountSubStages is used when the StateMachine object does not hold all the Stage(s).
 // This allows you to design multiple pipleines that use the same data object but will
-// be executed as a single pipeline. CountSubStages is used to correctly calculate
+// be executed as a single pipeline. WithCountSubStages is used to correctly calculate
 // the concurrency. Without this, only stages in the StateMachine object will be counted
 // toward the concurrency count.
-func CountSubStages[T any](subStageObj ...any) Option[T] {
-	return func(pipelines *Pipelines[T]) error {
-		for _, obj := range subStageObj {
-			pipelines.subStages += numStages[T](obj)
-		}
-		return nil
+func WithCountSubStages(subStageObj ...any) Option {
+	return func(o pipelinesOptions) (pipelinesOptions, error) {
+		o.subStageObjs = append(o.subStageObjs, subStageObj...)
+		return o, nil
 	}
 }
 
@@ -385,12 +392,41 @@ func resetNext[T any](req Request[T]) Request[T] {
 // New creates a new Pipelines object with "num" pipelines running in parallel.
 // Each underlying pipeline runs concurrently for each stage. The first StateMachine.Start()
 // in the list is the starting place for executions
-func New[T any](name string, num int, sm StateMachine[T], options ...Option[T]) (*Pipelines[T], error) {
+func New[T any](name string, num int, sm StateMachine[T], options ...Option) (*Pipelines[T], error) {
 	if num < 1 {
 		return nil, fmt.Errorf("num must be > 0")
 	}
 	if sm == nil {
 		return nil, fmt.Errorf("must provide a valid StateMachine")
+	}
+
+	opts := pipelinesOptions{}
+	for _, o := range options {
+		var err error
+		opts, err = o(opts)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Options are type-erased so Option can be non-generic; resolve the T-dependent ones here.
+	// PreProcessors always start with the built-in resetNext.
+	preProcessors := []PreProcesor[T]{resetNext[T]}
+	for i, pp := range opts.preProcessors {
+		switch f := pp.(type) {
+		case PreProcesor[T]:
+			preProcessors = append(preProcessors, f)
+		case func(Request[T]) Request[T]:
+			preProcessors = append(preProcessors, f)
+		default:
+			var want PreProcesor[T]
+			return nil, fmt.Errorf("stagedpipe.WithPreProcessors: preprocessor at index %d has type %T, want %T", i, pp, want)
+		}
+	}
+
+	subStages := 0
+	for _, obj := range opts.subStageObjs {
+		subStages += numStages[T](obj)
 	}
 
 	in := make(chan Request[T], 1)
@@ -403,7 +439,7 @@ func New[T any](name string, num int, sm StateMachine[T], options ...Option[T]) 
 			return r.groupNum
 		},
 		func(r Request[T], err error) {
-			log.Fatalf("bug: received %#+v and got demux error: %s", r, err)
+			panic(fmt.Sprintf("bug: received %#+v and got demux error: %s", r, err))
 		},
 	)
 	if err != nil {
@@ -411,22 +447,18 @@ func New[T any](name string, num int, sm StateMachine[T], options ...Option[T]) 
 	}
 
 	p := &Pipelines[T]{
-		name:  name,
-		in:    in,
-		out:   out,
-		wg:    &sync.WaitGroup{},
-		sm:    sm,
-		stats: stats,
-		demux: d,
-		preProcessors: []PreProcesor[T]{
-			resetNext[T],
-		},
-	}
-
-	for _, o := range options {
-		if err := o(p); err != nil {
-			return nil, err
-		}
+		name:          name,
+		in:            in,
+		out:           out,
+		wg:            &sync.WaitGroup{},
+		sm:            sm,
+		stats:         stats,
+		demux:         d,
+		preProcessors: preProcessors,
+		subStages:     subStages,
+		delayWarning:  opts.delayWarning,
+		ss:            opts.ss,
+		ordered:       opts.ordered,
 	}
 
 	pipelines := make([]*pipeline[T], 0, num)
@@ -445,11 +477,12 @@ func New[T any](name string, num int, sm StateMachine[T], options ...Option[T]) 
 			ss:            p.ss,
 		}
 
-		_, err := newPipeline(args)
+		pl, err := newPipeline(args)
 		if err != nil {
 			close(in)
 			return nil, err
 		}
+		pipelines = append(pipelines, pl)
 	}
 	p.pipelines = pipelines
 
@@ -478,7 +511,7 @@ type RequestGroup[T any] struct {
 	// span is the Open Telemetry span for this Request.
 	span span.Span
 
-	// ordered is used to handle ordering of output when the Ordered() option is set.
+	// ordered is used to handle ordering of output when the WithOrdered() option is set.
 	// If set to nil, the output is not ordered.
 	ordered *demux.InOrder[uint64, Request[T]]
 
@@ -530,7 +563,8 @@ func (r *RequestGroup[T]) Submit(req Request[T]) error {
 			gName = "unnamed"
 		}
 
-		req.Ctx, r.span = span.New(req.Ctx, fmt.Sprintf("stagedpipe.RequestGroup(%s)", gName))
+		groupName := fmt.Sprintf("stagedpipe.RequestGroup(%s)", gName)
+		req.Ctx, r.span = context.NewSpan(req.Ctx, span.WithName(groupName))
 
 		// Record the time the first request was submitted.
 		t := time.Now()
@@ -549,7 +583,8 @@ func (r *RequestGroup[T]) Submit(req Request[T]) error {
 	r.wg.Add(1)
 
 	// Create a child context with a new child span for the request.
-	ctx, spanner := span.New(req.Ctx, fmt.Sprintf("stagedpipe.RequestGroup(%s).Request(%d)", gName, req.itemNum))
+	reqName := fmt.Sprintf("stagedpipe.RequestGroup(%s).Request(%d)", gName, req.itemNum)
+	ctx, spanner := context.NewSpan(req.Ctx, span.WithName(reqName))
 	req.Ctx = ctx
 	req.span = spanner
 
@@ -574,17 +609,19 @@ func (r *RequestGroup[T]) Out() chan Request[T] {
 }
 
 func (r *RequestGroup[T]) otelStart() {
-	if r.span.Span == nil || !r.span.Span.IsRecording() {
+	if !r.span.IsRecording() {
 		return
 	}
-	r.span.Event("Started Submit()", "time_ns", r.started.Load())
+	// The span timestamps its own events, so we don't attach the start time as an attribute.
+	r.span.Event("Started Submit()")
 }
 
 func (r *RequestGroup[T]) otelEnd() {
-	if r.span.Span == nil || !r.span.Span.IsRecording() {
+	if !r.span.IsRecording() {
 		return
 	}
-	r.span.Event("RequestGroup finished", "elapsed_ns", time.Since(*r.started.Load()))
+	r.span.Event("RequestGroup finished", attribute.Int64("elapsed_ns", int64(time.Since(*r.started.Load()))))
+	r.span.End() // End the RequestGroup span; otherwise it is created but never closed.
 }
 
 // NewRequestGroup returns a RequestGroup that can be used to process requests
@@ -612,9 +649,10 @@ func (p *Pipelines[T]) NewRequestGroup() *RequestGroup[T] {
 			defer r.ordered.Close()
 			for req := range r.out {
 				r.wg.Done()
+				r.p.wg.Done()
 				req.otelEnd()
 				if err := r.ordered.Add(req); err != nil {
-					panic("bug: ordered demuxer returned an error")
+					panic(fmt.Sprintf("bug: ordered demuxer: %s", err))
 				}
 			}
 		}()
@@ -623,6 +661,7 @@ func (p *Pipelines[T]) NewRequestGroup() *RequestGroup[T] {
 			defer close(r.user)
 			for req := range r.out {
 				r.wg.Done()
+				r.p.wg.Done()
 				req.otelEnd()
 				r.user <- req
 			}
@@ -721,16 +760,18 @@ func (p *pipeline[T]) runner() {
 	}
 }
 
-// processReq processes a single request through the pipeline.
-func (p *pipeline[T]) processReq(r Request[T]) Request[T] {
+// processReq processes a single request through the pipeline. The return is named so the
+// deferred cleanup below clears seenStages on the value actually returned to the caller; an
+// unnamed return would copy r out before the defer ran, leaking a pooled object to the caller.
+func (p *pipeline[T]) processReq(r Request[T]) (out Request[T]) {
 	// Stat colllection.
 	r.ingestTime = time.Now()
 	queuedTime := time.Since(r.queueTime)
 	if p.ss {
 		r.seenStages = seenStagesPool.Get().(*seenStages).reset()
 		defer func() {
-			seenStagesPool.Put(r.seenStages)
-			r.seenStages = nil
+			seenStagesPool.Put(out.seenStages)
+			out.seenStages = nil
 		}()
 	}
 
@@ -757,23 +798,35 @@ func (p *pipeline[T]) processReq(r Request[T]) Request[T] {
 	}
 }
 
-// execStage executes a single stage of the pipeline and all preProcessors. It also
-// creates a new span for the stage.
-func (p *pipeline[T]) execStage(r Request[T], stage Stage[T]) Request[T] {
-	stageName := methodName(stage)
+// execStage executes a single stage of the pipeline and all preProcessors. When the Request is
+// recording it also creates a per-stage OTEL span. The return is named so the deferred span/ctx
+// restore below applies to the value the caller receives (an unnamed return would copy out first).
+func (p *pipeline[T]) execStage(r Request[T], stage Stage[T]) (out Request[T]) {
+	recording := r.span.IsRecording()
 
-	parentCtx := r.Ctx
-	parentSpan := r.span
-	defer func() {
-		r.Ctx = parentCtx
-		r.span = parentSpan
-	}()
-	r.Ctx, r.span = span.New(r.Ctx, stageName)
+	// stageName is only needed for OTEL span/event naming (when recording) or for cyclic
+	// detection (when the WithDAG option is set). On the common !recording, non-DAG path it is
+	// never computed, keeping methodName's reflection off the hot path.
+	var stageName string
+	if recording || r.seenStages != nil {
+		stageName = methodName(stage)
+	}
 
-	r.Event(stageName, "start", time.Now())
-	defer func() {
-		r.Event(stageName, "end", time.Now())
-	}()
+	// All OTEL work is gated behind recording: when tracing is off this whole block is skipped,
+	// avoiding a per-stage NewSpan, the event attribute allocations, and two defers.
+	if recording {
+		parentCtx := r.Ctx
+		parentSpan := r.span
+		r.Ctx, r.span = context.NewSpan(r.Ctx, span.WithName(stageName))
+		// The span timestamps its own events, so we record only the phase.
+		r.span.Event(stageName, attribute.String("phase", "start"))
+		defer func() {
+			out.span.Event(stageName, attribute.String("phase", "end"))
+			out.span.End() // End the per-stage span before restoring the parent onto out.
+			out.Ctx = parentCtx
+			out.span = parentSpan
+		}()
+	}
 
 	// If the context has been cancelled, stop processing.
 	if r.Ctx.Err() != nil {
@@ -782,7 +835,7 @@ func (p *pipeline[T]) execStage(r Request[T], stage Stage[T]) Request[T] {
 	}
 
 	if r.seenStages != nil {
-		if r.seenStages.seen(methodName(stage)) {
+		if r.seenStages.seen(stageName) {
 			r.Err = Error{Type: cyclicErr, Msg: r.seenStages.callTrace()}
 			return r
 		}
@@ -818,16 +871,26 @@ func numStages[T any](sm any) int {
 	return count
 }
 
+// methodNameCache memoizes methodName by a function's entry PC so the reflection and FuncForPC
+// lookup run once per distinct stage instead of once per stage per request. Distinct funcs (and
+// method values) have distinct, stable entry PCs, so the PC is a valid key. Reads are lock-free
+// once warm.
+var methodNameCache sync.Map // map[uintptr]string
+
 // methodName takes a function or a method and returns its name.
 func methodName(method any) string {
 	if method == nil {
 		return "<nil>"
 	}
 	valueOf := reflect.ValueOf(method)
-	switch valueOf.Kind() {
-	case reflect.Func:
-		return strings.TrimSuffix(strings.TrimSuffix(runtime.FuncForPC(valueOf.Pointer()).Name(), "-fm"), "[...]")
-	default:
+	if valueOf.Kind() != reflect.Func {
 		return "<not a function>"
 	}
+	pc := valueOf.Pointer()
+	if v, ok := methodNameCache.Load(pc); ok {
+		return v.(string)
+	}
+	name := strings.TrimSuffix(strings.TrimSuffix(runtime.FuncForPC(pc).Name(), "-fm"), "[...]")
+	methodNameCache.Store(pc, name)
+	return name
 }

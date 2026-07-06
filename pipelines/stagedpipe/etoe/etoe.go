@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
@@ -10,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gostdlib/base/context"
 
 	"github.com/gostdlib/concurrency/pipelines/stagedpipe"
 )

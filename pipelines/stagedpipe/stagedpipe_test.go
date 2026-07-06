@@ -1,7 +1,7 @@
 package stagedpipe
 
 import (
-	"context"
+	"errors"
 	"fmt"
 	"log"
 	"runtime"
@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gostdlib/base/context"
 	"github.com/gostdlib/concurrency/pipelines/stagedpipe/testing/client"
 )
 
@@ -307,7 +308,7 @@ func TestDAG(t *testing.T) {
 		"test statemachine",
 		10,
 		sm,
-		DAG[DAGData](),
+		WithDAG(),
 	)
 
 	if err != nil {
@@ -377,6 +378,229 @@ func TestDAG(t *testing.T) {
 			if !IsErrCyclic(got[i].Err) {
 				t.Errorf("request %d, got %q, want a cyclic error", i, got[i].Err)
 			}
+		}
+	}
+}
+
+// closeSM is a minimal StateMachine that records when Close() is called. It is used to
+// regression-test that Pipelines.Close() actually completes its shutdown work.
+type closeSM struct {
+	closed chan struct{}
+}
+
+func newCloseSM() *closeSM {
+	return &closeSM{closed: make(chan struct{})}
+}
+
+func (s *closeSM) Start(req Request[int]) Request[int] {
+	req.Next = nil
+	return req
+}
+
+func (s *closeSM) Close() {
+	close(s.closed)
+}
+
+// TestClose is a regression test for a bug where p.wg was incremented on every Submit but
+// only decremented on the context-cancel path, never when a Request drained out normally.
+// That left Pipelines.Close()'s goroutine blocked forever on p.wg.Wait(), so the output
+// channel was never closed and sm.Close() was never called. We submit and fully drain a
+// batch of Requests, call Close(), and require sm.Close() to run within a timeout.
+func TestClose(t *testing.T) {
+	t.Parallel()
+
+	sm := newCloseSM()
+	p, err := New[int]("close regression", 2, sm)
+	if err != nil {
+		t.Fatalf("TestClose: cannot create pipeline: %s", err)
+	}
+
+	rg := p.NewRequestGroup()
+
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for range rg.Out() {
+		}
+	}()
+
+	for i := 0; i < 10; i++ {
+		req := Request[int]{Ctx: t.Context(), Data: i}
+		if err := rg.Submit(req); err != nil {
+			t.Fatalf("TestClose: problem submitting request: %s", err)
+		}
+	}
+	rg.Close()
+	<-drained
+
+	// Close() spawns a goroutine that waits for every Request to finish, then closes the
+	// output channel and calls sm.Close(). If p.wg is never decremented on the success
+	// path, that goroutine blocks forever and sm.Close() is never reached.
+	p.Close()
+
+	select {
+	case <-sm.closed:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("TestClose: sm.Close() was never called; Pipelines.Close() did not complete (p.wg never reached zero)")
+	}
+}
+
+// statsSM is a minimal StateMachine whose stage takes a small, non-zero amount of time so
+// that recorded run durations are reliably > 0.
+type statsSM struct{}
+
+func (s *statsSM) Start(req Request[int]) Request[int] {
+	time.Sleep(time.Millisecond)
+	req.Next = nil
+	return req
+}
+
+func (s *statsSM) Close() {}
+
+// TestStats is a regression test for a bug where the min stats were seeded at 0, so setMin
+// (which only stores a smaller value) could never record a real minimum and Stats.Min was
+// always reported as 0 regardless of how long Requests actually took.
+func TestStats(t *testing.T) {
+	t.Parallel()
+
+	p, err := New[int]("stats regression", 2, &statsSM{})
+	if err != nil {
+		t.Fatalf("TestStats: cannot create pipeline: %s", err)
+	}
+	defer p.Close()
+
+	rg := p.NewRequestGroup()
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for range rg.Out() {
+		}
+	}()
+
+	for i := 0; i < 20; i++ {
+		if err := rg.Submit(Request[int]{Ctx: t.Context(), Data: i}); err != nil {
+			t.Fatalf("TestStats: problem submitting request: %s", err)
+		}
+	}
+	rg.Close()
+	<-drained
+
+	got := p.Stats()
+	switch {
+	case got.Completed != 20:
+		t.Fatalf("TestStats: Completed = %d, want 20", got.Completed)
+	case got.Min <= 0:
+		t.Fatalf("TestStats: Min = %v, want > 0 (the minimum run duration was never recorded)", got.Min)
+	case got.Min > got.Max:
+		t.Fatalf("TestStats: Min (%v) > Max (%v)", got.Min, got.Max)
+	}
+}
+
+// TestNewCapturesPipelines is a regression test for a bug where New() discarded every
+// *pipeline[T] returned by newPipeline(), so p.pipelines was always an empty slice and the
+// individual pipeline handles were unreachable.
+func TestNewCapturesPipelines(t *testing.T) {
+	t.Parallel()
+
+	const num = 4
+
+	p, err := New[int]("pipelines regression", num, &statsSM{})
+	if err != nil {
+		t.Fatalf("TestNewCapturesPipelines: cannot create pipeline: %s", err)
+	}
+	defer p.Close()
+
+	if len(p.pipelines) != num {
+		t.Fatalf("TestNewCapturesPipelines: len(p.pipelines) = %d, want %d", len(p.pipelines), num)
+	}
+	for i, pl := range p.pipelines {
+		if pl == nil {
+			t.Fatalf("TestNewCapturesPipelines: p.pipelines[%d] is nil", i)
+		}
+	}
+}
+
+// TestIsErrCyclic is a regression test for IsErrCyclic not being wrap-aware: a cyclic Error
+// hidden behind fmt.Errorf("%w", ...) used to report false.
+func TestIsErrCyclic(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "a nil error is not cyclic", err: nil, want: false},
+		{name: "a plain cyclic Error is cyclic", err: Error{Type: cyclicErr}, want: true},
+		{name: "a wrapped cyclic Error is cyclic", err: fmt.Errorf("stage failed: %w", Error{Type: cyclicErr}), want: true},
+		{name: "a non-cyclic Error type is not cyclic", err: Error{Type: "other"}, want: false},
+		{name: "a plain error is not cyclic", err: errors.New("boom"), want: false},
+	}
+
+	for _, test := range tests {
+		got := IsErrCyclic(test.err)
+		if got != test.want {
+			t.Errorf("TestIsErrCyclic(%s): got %v, want %v", test.name, got, test.want)
+		}
+	}
+}
+
+// TestWithPreProcessors covers New()'s resolution of the type-erased WithPreProcessors
+// arguments into PreProcesor[T]: it must accept both the named PreProcesor[T] type and the
+// bare func(Request[T]) Request[T], reject anything else, and actually run what it accepts.
+func TestWithPreProcessors(t *testing.T) {
+	t.Parallel()
+
+	named := PreProcesor[int](func(r Request[int]) Request[int] { r.Data++; return r })
+	bare := func(r Request[int]) Request[int] { r.Data++; return r }
+
+	tests := []struct {
+		name    string
+		pp      any
+		wantErr bool
+	}{
+		{name: "Success: a PreProcesor[T] value is accepted", pp: named, wantErr: false},
+		{name: "Success: a bare func(Request[T]) Request[T] is accepted", pp: bare, wantErr: false},
+		{name: "Error: a value that is not a function is rejected", pp: 42, wantErr: true},
+		{name: "Error: a func with the wrong T is rejected", pp: func(r Request[string]) Request[string] { return r }, wantErr: true},
+	}
+
+	for _, test := range tests {
+		p, err := New[int]("preproc test", 1, &statsSM{}, WithPreProcessors(test.pp))
+		switch {
+		case err == nil && test.wantErr:
+			t.Errorf("TestWithPreProcessors(%s): got err == nil, want err != nil", test.name)
+			continue
+		case err != nil && !test.wantErr:
+			t.Errorf("TestWithPreProcessors(%s): got err == %s, want err == nil", test.name, err)
+			continue
+		case err != nil:
+			continue
+		}
+
+		// Success path: send one Request through and confirm the preprocessor ran (Data++).
+		rg := p.NewRequestGroup()
+		got := []int{}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for out := range rg.Out() {
+				got = append(got, out.Data)
+			}
+		}()
+		if err := rg.Submit(Request[int]{Ctx: t.Context(), Data: 5}); err != nil {
+			t.Errorf("TestWithPreProcessors(%s): problem submitting request: %s", test.name, err)
+			rg.Close()
+			<-done
+			p.Close()
+			continue
+		}
+		rg.Close()
+		<-done
+		p.Close()
+
+		if len(got) != 1 || got[0] != 6 {
+			t.Errorf("TestWithPreProcessors(%s): got Data %v, want [6] (preprocessor should have incremented 5)", test.name, got)
 		}
 	}
 }

@@ -1,10 +1,11 @@
 package generics
 
 import (
-	"context"
 	"math/rand"
 	"testing"
 	"time"
+
+	"github.com/gostdlib/base/context"
 )
 
 func BenchmarkPipeline(b *testing.B) {
