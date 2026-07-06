@@ -299,6 +299,8 @@ type Pipelines[T any] struct {
 	ss bool
 	// ordered is true if the WithOrdered() option was set.
 	ordered bool
+	// scaler drives dynamic worker autoscaling when WithAutoScale() is set; nil otherwise.
+	scaler *scaler[T]
 }
 
 // pipelinesOptions holds the values set by the Option(s) passed to New(). It is type-erased
@@ -318,6 +320,8 @@ type pipelinesOptions struct {
 	// subStageObjs holds objects whose Stage methods are counted toward concurrency but that
 	// do not live on the StateMachine. New() counts their stages once T is known.
 	subStageObjs []any
+	// autoScale, when non-nil, enables dynamic worker autoscaling within its [min, max] bounds.
+	autoScale *autoScaleCfg
 }
 
 // Option is an option for the New() constructor. It is not generic, so a single set of Option
@@ -475,6 +479,7 @@ func New[T any](name string, num int, sm StateMachine[T], options ...Option) (*P
 			stats:         stats,
 			delayWarning:  p.delayWarning,
 			ss:            p.ss,
+			autoscale:     opts.autoScale != nil,
 		}
 
 		pl, err := newPipeline(args)
@@ -486,12 +491,43 @@ func New[T any](name string, num int, sm StateMachine[T], options ...Option) (*P
 	}
 	p.pipelines = pipelines
 
+	// With autoscaling on, no pipeline spawned runners; the scaler owns the flat worker pool. It
+	// starts at the fixed base (num × per-pipeline stage width) clamped into [min, max] and adjusts
+	// from there.
+	if opts.autoScale != nil {
+		// One pipeline is width workers. min/max are pipeline counts; start at num pipelines
+		// (clamped) and scale in whole-pipeline (width-worker) steps between [min*width, max*width].
+		width := numStages[T](sm) + subStages
+		initial := clamp(num, opts.autoScale.min, opts.autoScale.max) * width
+		s := &scaler[T]{
+			stats:  stats,
+			spawn1: pipelines[0].runner,
+			quit:   make(chan struct{}),
+			stop:   make(chan struct{}),
+			size:   initial,
+			ctrl: &ctrl{
+				width: width,
+				minW:  opts.autoScale.min * width,
+				maxW:  opts.autoScale.max * width,
+			},
+			clk: realClock{},
+		}
+		s.spawn(initial)
+		p.scaler = s
+		go s.loop()
+	}
+
 	return p, nil
 }
 
 // Close closes the ingestion of the Pipeline. No further Submit calls should be made.
 // If called more than once Close will panic.
 func (p *Pipelines[T]) Close() {
+	// Stop the autoscale governor first so it stops issuing quit tokens; then closing p.in exits
+	// every worker regardless of how many the governor had spawned.
+	if p.scaler != nil {
+		close(p.scaler.stop)
+	}
 	close(p.in)
 
 	go func() {
@@ -702,6 +738,9 @@ type pipelineArgs[T any] struct {
 	num           int
 	subStages     int
 	delayWarning  time.Duration
+	// autoscale, when true, means the Pipelines-level scaler owns worker spawning, so newPipeline
+	// starts no runners of its own.
+	autoscale bool
 }
 
 // newPipeline creates a new Pipeline. A new Pipeline should be created for a new set of related
@@ -725,37 +764,60 @@ func newPipeline[T any](args pipelineArgs[T]) (*pipeline[T], error) {
 		return nil, fmt.Errorf("did not find any Public methods that implement Stages")
 	}
 
+	// When autoscaling, the Pipelines-level scaler owns all worker goroutines, so this pipeline
+	// spawns none of its own.
+	if args.autoscale {
+		return p, nil
+	}
+
 	for i := 0; i < p.concurrency; i++ {
-		go p.runner()
+		go p.runner(nil, nil)
 	}
 
 	return p, nil
 }
 
-// Submit submits a request for processing.
-func (p *pipeline[T]) runner() {
+// runner processes requests until either p.in is closed (Close) or a quit token is received (the
+// autoscaler removing this worker). quit is nil in fixed mode, where its select case never fires so
+// the loop behaves exactly like ranging p.in. live, when non-nil, tracks the live worker count for
+// the autoscaler and is decremented on every exit path.
+func (p *pipeline[T]) runner(quit <-chan struct{}, live *atomic.Int64) {
+	if live != nil {
+		defer live.Add(-1)
+	}
 	id := fmt.Sprintf("%s-%d", p.name, p.id)
 	var tick *time.Ticker
 	if p.delayWarning != 0 {
 		tick = time.NewTicker(p.delayWarning)
+		// Stop on every exit path. Under autoscale, workers are removed continuously, so a leaked
+		// ticker would keep firing and accumulate for the life of the process.
+		defer tick.Stop()
 	}
-	for r := range p.in {
-		r = r.otelStart()
-		r = p.processReq(r)
-		p.calcExitStats(r)
-		if p.delayWarning != 0 {
-			for {
-				tick.Reset(p.delayWarning)
-				select {
-				case p.out <- r:
-				case <-tick.C:
-					log.Printf("pipeline(%s) is having output delays exceeding %v", id, p.delayWarning)
-					continue
-				}
-				break
+	for {
+		select {
+		case r, ok := <-p.in:
+			if !ok {
+				return
 			}
-		} else {
-			p.out <- r
+			r = r.otelStart()
+			r = p.processReq(r)
+			p.calcExitStats(r)
+			if p.delayWarning != 0 {
+				for {
+					tick.Reset(p.delayWarning)
+					select {
+					case p.out <- r:
+					case <-tick.C:
+						log.Printf("pipeline(%s) is having output delays exceeding %v", id, p.delayWarning)
+						continue
+					}
+					break
+				}
+			} else {
+				p.out <- r
+			}
+		case <-quit:
+			return
 		}
 	}
 }
