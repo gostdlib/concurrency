@@ -14,6 +14,7 @@ This package supports:
 - A concurrent pipeline that can be run in parallel
 - Multiple users can use a single set of pipelines, not a pipeline setup per user
 - No need to run your own goroutines, simply scale up parallelism
+- Optionally autoscale the number of running pipelines up and down based on live throughput
 - Generic, so it avoids runtime type checks of data objects
 - Data can be on the stack or the heap
 - Retrieve Stats on how the pipeline is running
@@ -147,7 +148,7 @@ But what if you want to keep your pipelines running and have multiple ingress st
 
 I hate to say "the solution", because there are many ways you can solve this. But I was looking to create a framework that was elegant in how it handled this.
 
-What I've done here is combine a state machine with a pipeline. For each stage in the state machine, we spin off 1 goroutine that is running the state machine. We receive input on a single channel and send output on a single channel. The input gets sent to any state machine that is available to process and each state machine sends to the `out` channel.
+What I've done here is combine a state machine with a pipeline. For each stage in your state machine we run one goroutine — a _worker_ — so a `StateMachine` with `C` stages runs `C` workers per pipeline. All workers read from a single shared input channel and write to a single shared output channel. Unlike the standard model, there are no channels between stages: a worker takes one request and runs it through the _entire_ state machine end-to-end (following the routing you set via `req.Next`), then the next free worker picks up the next request. So a "pipeline" here is really just `C` interchangeable workers, each carrying one request all the way through.
 
 ```
 Four Pipelines processing
@@ -165,8 +166,37 @@ in ->->               ->-> out
         -> stages ->
 ```
 
-You can than concurrently run multiple pipelines. This differs from the standard model in that a full pipeline might not have all stages running, but it will have the same number of stages running. Mathmatically, we still end up in a X \* Y number of concurrent actions.
+You can then concurrently run multiple pipelines. This differs from the standard model in that a request is not handed stage-to-stage between goroutines; instead each worker carries one request through all of its stages. With `Y` pipelines of `X` stages you run `X * Y` workers, so up to `X * Y` requests process at once — each at whatever stage it has currently reached.
 
 `Stage`s are constructed inside a type that implements our `StateMachine` interface. Any method on that object that is `Public` and implements `Stage` becomes a valid stage to be run. You pass the `StateMachine` to our `New()` constructor with the number of parallel pipelines (all running concurrently) that you wish to run. A good starting number is either 1 or `runtime.NumCPU()`. The more stages you have or the more blocing on IO you have, the more 1 is a great starting point.
 
 Accessing the pipeline happens by creating a `RequestGroup`. You can simply stream values in and out of the pipeline separate from other `RequestGroup`s using the the `Submit()` method and `Out` channel.
+
+## Autoscaling the number of pipelines
+
+By default the number of pipelines is fixed at construction (the `num` argument to `New()`), giving `num × C` worker goroutines, where `C` is the number of `Stage` methods on your `StateMachine` (plus any counted with `WithCountSubStages`). Each worker pulls a request and runs it through the whole state machine, so `num × C` requests can be in flight at once.
+
+If you don't know the right number ahead of time — or the ideal number changes with load — use the `WithAutoScale` option to let the pipeline tune itself:
+
+```go
+p, err := stagedpipe.New(
+    "my-pipeline",
+    runtime.NumCPU(),                 // starting (base) number of pipelines
+    sm,
+    stagedpipe.WithAutoScale(1, 32),  // scale between 1 and 32 pipelines
+)
+```
+
+`WithAutoScale(min, max)`'s bounds are in **pipelines**: one pipeline is `C` workers, so the live worker count moves between `min × C` and `max × C`, and every adjustment adds or removes a whole pipeline (`C` workers) at a time. The pool starts at `num` pipelines, clamped into `[min, max]`.
+
+A background governor samples throughput (completed requests per interval) and:
+
+- **adds a pipeline** while the pool is saturated (every worker busy) and throughput keeps improving,
+- **holds** once another pipeline no longer helps — you've found the sweet spot,
+- **backs off** a pipeline if adding one hurt throughput,
+- **releases** idle pipelines when load drops, down to `min`, and
+- **re-probes** upward periodically to track a workload whose ideal size changes over time.
+
+Because it only adds workers when the pool is genuinely saturated, an autoscaled pipeline that is bottlenecked on offered load (rather than on worker count) correctly stays near its base/minimum instead of spinning up workers that cannot help.
+
+**Caveat:** with autoscaling on, up to `max × C` copies of your `Stage` methods can run at once (versus `num × C` when off). Make sure your `StateMachine` is safe at `max × C` concurrency — any shared client, buffer, or semaphore it holds must be sized for that.
