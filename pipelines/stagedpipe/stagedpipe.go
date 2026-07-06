@@ -4,6 +4,9 @@ statemachine to process work. For N number of Stages in the StateMachine, N Stag
 can concurrently be processed. You can run pipelines in parallel. So X Pipelines
 with N Stages will have X*N Stages processing.
 
+The number of pipelines can be fixed or, with the WithAutoScale() option, automatically
+scaled up and down between bounds based on live throughput.
+
 This library requires working knowledge of both the specific type of Go statemachine
 implementation and basic Go pipelining.
 
