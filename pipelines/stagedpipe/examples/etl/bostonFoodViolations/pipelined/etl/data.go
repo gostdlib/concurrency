@@ -1,10 +1,11 @@
 package etl
 
 import (
-	"context"
 	_ "embed"
 	"sync"
 	"time"
+
+	"github.com/gostdlib/base/context"
 
 	"github.com/jackc/pgx/v4"
 

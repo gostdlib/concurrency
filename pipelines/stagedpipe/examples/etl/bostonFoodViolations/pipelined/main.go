@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	_ "embed"
 	"encoding/csv"
 	"flag"
@@ -13,6 +12,8 @@ import (
 	"runtime"
 	"sync"
 	"time"
+
+	"github.com/gostdlib/base/context"
 
 	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"

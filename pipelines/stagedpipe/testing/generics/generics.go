@@ -1,9 +1,10 @@
 package generics
 
 import (
-	"context"
 	"fmt"
 	"sync"
+
+	"github.com/gostdlib/base/context"
 )
 
 /* Code that makes up a statemachine pipeline */

@@ -1,6 +1,7 @@
 package stagedpipe
 
 import (
+	"math"
 	"sync/atomic"
 	"time"
 )
@@ -34,15 +35,23 @@ type stats struct {
 }
 
 func newStats() *stats {
-	return &stats{ingestStats: &ingestStats{}}
+	s := &stats{ingestStats: &ingestStats{}}
+	// Seed the minimums to MaxInt64 so the first recorded value wins in setMin. Left at 0,
+	// no positive duration is ever smaller, so Min would always report 0.
+	s.min.Store(math.MaxInt64)
+	s.ingestStats.min.Store(math.MaxInt64)
+	return s
 }
 
 func (s *stats) toStats() Stats {
 	stats := Stats{
 		Running:   s.running.Load(),
 		Completed: s.completed.Load(),
-		Min:       time.Duration(s.min.Load()),
 		Max:       time.Duration(s.max.Load()),
+	}
+	// Report Min only once a real value has been recorded; the seed value means "unset".
+	if m := s.min.Load(); m != math.MaxInt64 {
+		stats.Min = time.Duration(m)
 	}
 	if stats.Completed != 0 {
 		stats.Avg = time.Duration(s.avgTotal.Load() / stats.Completed)
@@ -69,8 +78,11 @@ type ingestStats struct {
 
 func (i *ingestStats) toIngestStats(completed int64) IngestStats {
 	stats := IngestStats{
-		Min: time.Duration(i.min.Load()),
 		Max: time.Duration(i.max.Load()),
+	}
+	// Report Min only once a real value has been recorded; the seed value means "unset".
+	if m := i.min.Load(); m != math.MaxInt64 {
+		stats.Min = time.Duration(m)
 	}
 	if completed != 0 {
 		stats.Avg = time.Duration(i.avgTotal.Load() / completed)
