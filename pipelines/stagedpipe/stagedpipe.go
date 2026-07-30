@@ -80,6 +80,7 @@ import (
 	"log"
 	"reflect"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -128,6 +129,29 @@ func IsErrCyclic(err error) bool {
 	}
 	return t.Type == cyclicErr
 }
+
+// PanicError is the value a Pipelines re-panics with, on the caller's goroutine, after a stage
+// panicked. Value is the original panic and Stack is the stack captured at the panic site — the
+// live re-panic stack belongs to the caller, not the worker goroutine that panicked, so the
+// captured Stack is how the origin is preserved. Recover it with a type assertion to PanicError.
+type PanicError struct {
+	// Value is the value the stage passed to panic().
+	Value any
+	// Stack is the stack trace captured in the worker at the moment of the panic.
+	Stack []byte
+}
+
+// Error implements error.
+func (e PanicError) Error() string {
+	return fmt.Sprintf("stagedpipe: panic in pipeline stage: %v\n\noriginating stack:\n%s", e.Value, e.Stack)
+}
+
+// ErrTornDown is the per-Request error set on every Request once the pipeline is tearing down after
+// a stage panic — both the Requests fast-drained by execStage and the ones whose barrier wait was
+// aborted. It is permanent (wraps ErrPermanent), so a retrying caller gives up; match it with
+// errors.Is(err, ErrTornDown). The original panic surfaces separately as a PanicError from
+// RequestGroup.Close().
+var ErrTornDown = fmt.Errorf("stagedpipe: pipeline torn down after a stage panic: %w", ErrPermanent)
 
 // seenStagesPool is a pool of seenStages objects to reduce allocations.
 var seenStagesPool = sync.Pool{
@@ -206,6 +230,21 @@ type Request[T any] struct {
 	groupNum uint64
 	// itemNum is used to track the order of the Request in the RequestGroup.
 	itemNum uint64
+
+	// ks is the live ordering state for this Request's partition key, assigned at Submit when keyed
+	// ordering is on (nil otherwise). It is carried on the Request so the ordering hot path reaches
+	// the key's sequencers without a registry lookup.
+	ks *keyState
+	// seq is the dense, 0-based per-key sequence assigned at Submit. It is the turn a Request takes
+	// at each ordered stage for its key. Unused when keyed ordering is off.
+	seq uint64
+	// clearedMask is the set of ordered barriers this Request has resolved, one bit per barrier
+	// indexed by keyOrder.barrierIdx. Used to enforce at-most-once resolution and to drive the exit
+	// clear of barriers the Request never reached.
+	clearedMask uint64
+	// admitted is true once this Request holds one of its key's admission slots (WithAdmissionDepth),
+	// so the exit hook releases exactly the slots that were acquired.
+	admitted bool
 }
 
 func (r Request[T]) otelStart() Request[T] {
@@ -304,6 +343,13 @@ type Pipelines[T any] struct {
 	ordered bool
 	// scaler drives dynamic worker autoscaling when WithAutoScale() is set; nil otherwise.
 	scaler *scaler[T]
+	// keyOrder holds keyed-ordering config and per-key state when WithKey/WithOrderedStages are set;
+	// nil otherwise. When nil, the ordering hooks are skipped entirely and pay nothing.
+	keyOrder *keyOrder[T]
+	// panicked holds the first stage panic seen by any worker (nil until one happens). Once set, the
+	// workers stop running stage bodies and fast-drain the remaining Requests with a torn-down error,
+	// and RequestGroup.Close re-panics with it. Shared by every worker via a pointer.
+	panicked atomic.Pointer[PanicError]
 }
 
 // pipelinesOptions holds the values set by the Option(s) passed to New(). It is type-erased
@@ -325,6 +371,40 @@ type pipelinesOptions struct {
 	subStageObjs []any
 	// autoScale, when non-nil, enables dynamic worker autoscaling within its [min, max] bounds.
 	autoScale *autoScaleCfg
+	// keyFunc is the WithKey partition-key extractor, type-erased as func(T) string; New() asserts
+	// it once T is known. nil when keyed ordering is off.
+	keyFunc any
+	// orderedStages holds the WithOrderedStages barriers, each a Stage[T] erased to any; New()
+	// resolves them to entry PCs once T is known. Empty when keyed ordering is off.
+	orderedStages []any
+	// stopKeyOnErr is the WithStopKeyOnErr flag: poison a key on its first Request error.
+	stopKeyOnErr bool
+	// admitDepth is the WithAdmissionDepth value and admitDepthSet marks it as explicitly given. New
+	// resolves the effective per-key bound: unset becomes defaultAdmitDepth, an explicit 0 stays 0
+	// (unbounded), any other value is used as-is.
+	admitDepth    int
+	admitDepthSet bool
+}
+
+// validate checks option combinations that do not depend on T. Keyed ordering is meaningful only
+// when WithKey and WithOrderedStages are set together, and WithStopKeyOnErr only alongside them;
+// each lone use is a permanent configuration error, as a bad configuration cannot succeed on retry.
+// The T-dependent resolution (asserting keyFunc's type and resolving stage PCs) happens in New once
+// T is known.
+func (o pipelinesOptions) validate() error {
+	hasKey := o.keyFunc != nil
+	hasStages := len(o.orderedStages) > 0
+	switch {
+	case hasKey && !hasStages:
+		return fmt.Errorf("stagedpipe: WithKey requires WithOrderedStages, otherwise nothing is ordered: %w", ErrPermanent)
+	case hasStages && !hasKey:
+		return fmt.Errorf("stagedpipe: WithOrderedStages requires WithKey to supply the partition key: %w", ErrPermanent)
+	case o.stopKeyOnErr && !hasKey:
+		return fmt.Errorf("stagedpipe: WithStopKeyOnErr requires WithKey: %w", ErrPermanent)
+	case o.admitDepthSet && !hasKey:
+		return fmt.Errorf("stagedpipe: WithAdmissionDepth requires WithKey: %w", ErrPermanent)
+	}
+	return nil
 }
 
 // Option is an option for the New() constructor. It is not generic, so a single set of Option
@@ -415,6 +495,31 @@ func New[T any](name string, num int, sm StateMachine[T], options ...Option) (*P
 			return nil, err
 		}
 	}
+	if err := opts.validate(); err != nil {
+		return nil, err
+	}
+
+	// Resolve keyed ordering (WithKey / WithOrderedStages) before anything spawns, so a bad
+	// configuration returns before a single pipeline goroutine or the scaler is started. validate()
+	// has already confirmed the two appear together, so a keyFunc means both are present. The
+	// keyFunc assertion and stage-PC resolution are T-dependent, hence resolved here in New[T].
+	var keyOrd *keyOrder[T]
+	if opts.keyFunc != nil {
+		keyFunc, ok := opts.keyFunc.(func(T) string)
+		if !ok {
+			return nil, fmt.Errorf("stagedpipe.WithKey: keyFunc %T is not func(T) string: %w", opts.keyFunc, ErrPermanent)
+		}
+		// Apply the default admission depth when the caller did not set one.
+		depth := opts.admitDepth
+		if !opts.admitDepthSet {
+			depth = defaultAdmitDepth
+		}
+		ko, err := newKeyOrder[T](keyFunc, opts.orderedStages, opts.stopKeyOnErr, depth)
+		if err != nil {
+			return nil, err
+		}
+		keyOrd = ko
+	}
 
 	// Options are type-erased so Option can be non-generic; resolve the T-dependent ones here.
 	// PreProcessors always start with the built-in resetNext.
@@ -439,6 +544,12 @@ func New[T any](name string, num int, sm StateMachine[T], options ...Option) (*P
 	in := make(chan Request[T], 1)
 	out := make(chan Request[T], 1)
 	stats := newStats()
+
+	// Keyed ordering records admission-wait through the shared stats; the workers record parked and
+	// barrier-wait through the same stats via pipeline.stats.
+	if keyOrd != nil {
+		keyOrd.stats = stats
+	}
 
 	d, err := demux.New(
 		out,
@@ -466,6 +577,7 @@ func New[T any](name string, num int, sm StateMachine[T], options ...Option) (*P
 		delayWarning:  opts.delayWarning,
 		ss:            opts.ss,
 		ordered:       opts.ordered,
+		keyOrder:      keyOrd,
 	}
 
 	pipelines := make([]*pipeline[T], 0, num)
@@ -483,6 +595,8 @@ func New[T any](name string, num int, sm StateMachine[T], options ...Option) (*P
 			delayWarning:  p.delayWarning,
 			ss:            p.ss,
 			autoscale:     opts.autoScale != nil,
+			keyOrder:      keyOrd,
+			panicked:      &p.panicked,
 		}
 
 		pl, err := newPipeline(args)
@@ -585,6 +699,12 @@ func (r *RequestGroup[T]) Close() {
 	r.otelEnd()
 
 	r.p.demux.RemoveReceiver(r.id) // This closes the input channel into the Pipelines object
+
+	// If a stage panicked while this group was in flight, re-raise it here — on the caller's
+	// goroutine, after every Request has drained — carrying the stack captured at the panic site.
+	if info := r.p.panicked.Load(); info != nil {
+		panic(*info)
+	}
 }
 
 // Submit submits a new Request into the Pipelines. A Request with a nil Context will
@@ -626,6 +746,18 @@ func (r *RequestGroup[T]) Submit(req Request[T]) error {
 	ctx, spanner := context.NewSpan(req.Ctx, span.WithName(reqName))
 	req.Ctx = ctx
 	req.span = spanner
+
+	// With keyed ordering on, enter assigns the partition key and per-key sequence and does the
+	// ordered send (sequence order == send order for a key). A cancelled send is resolved inside
+	// enter so no successor is stranded; here we only undo the wg accounting.
+	if r.p.keyOrder != nil {
+		if err := r.p.keyOrder.enter(req.Ctx, r.p.in, req); err != nil {
+			r.p.wg.Done()
+			r.wg.Done()
+			return err
+		}
+		return nil
+	}
 
 	select {
 	case <-req.Ctx.Done():
@@ -727,6 +859,11 @@ type pipeline[T any] struct {
 	concurrency   int
 	delayWarning  time.Duration
 	ss            bool
+	// keyOrder is shared with the parent Pipelines: the same registry serves every worker, since a
+	// key's Requests may be processed by different workers. nil when keyed ordering is off.
+	keyOrder *keyOrder[T]
+	// panicked points at the parent Pipelines' first-panic slot, shared by every worker.
+	panicked *atomic.Pointer[PanicError]
 }
 
 type pipelineArgs[T any] struct {
@@ -744,6 +881,10 @@ type pipelineArgs[T any] struct {
 	// autoscale, when true, means the Pipelines-level scaler owns worker spawning, so newPipeline
 	// starts no runners of its own.
 	autoscale bool
+	// keyOrder is the shared keyed-ordering registry, or nil when keyed ordering is off.
+	keyOrder *keyOrder[T]
+	// panicked points at the parent Pipelines' first-panic slot.
+	panicked *atomic.Pointer[PanicError]
 }
 
 // newPipeline creates a new Pipeline. A new Pipeline should be created for a new set of related
@@ -759,6 +900,8 @@ func newPipeline[T any](args pipelineArgs[T]) (*pipeline[T], error) {
 		sm:            args.sm,
 		ss:            args.ss,
 		delayWarning:  args.delayWarning,
+		keyOrder:      args.keyOrder,
+		panicked:      args.panicked,
 	}
 
 	p.concurrency = numStages[T](args.sm) + args.subStages
@@ -840,6 +983,15 @@ func (p *pipeline[T]) processReq(r Request[T]) (out Request[T]) {
 		}()
 	}
 
+	// Keyed ordering: on every exit path resolve the barriers this Request never cleared and drop its
+	// in-flight hold on the key. Deferred so it covers a mid-pipeline error return, a branch that
+	// skips a barrier, and normal completion alike.
+	if p.keyOrder != nil && r.ks != nil {
+		defer func() {
+			p.keyOrder.exit(out)
+		}()
+	}
+
 	p.stats.running.Add(1)
 	setMin(&p.stats.ingestStats.min, int64(queuedTime))
 	setMax(&p.stats.ingestStats.max, int64(queuedTime))
@@ -899,10 +1051,54 @@ func (p *pipeline[T]) execStage(r Request[T], stage Stage[T]) (out Request[T]) {
 		return r
 	}
 
+	// A stage has panicked somewhere in the pipeline: stop running stage bodies and fast-drain this
+	// Request with a torn-down error so it still flows out (keeping the wait-group balanced) while no
+	// further user code runs. The origin re-raises from RequestGroup.Close.
+	if p.panicked.Load() != nil {
+		r.Err = ErrTornDown
+		return r
+	}
+
+	// WithStopKeyOnErr: an earlier Request for this key failed, so skip this one without running any
+	// stage. Checked here (every stage) so a Request that has not yet reached a barrier — or is on a
+	// non-ordered stage — is skipped too, not only those released while parked at a barrier below.
+	if p.keyOrder != nil && p.keyOrder.stopKeyOnErr && r.ks != nil && r.ks.poisonedBefore(r.seq) {
+		r.Err = ErrKeyFailed
+		return r
+	}
+
 	if r.seenStages != nil {
 		if r.seenStages.seen(stageName) {
 			r.Err = Error{Type: cyclicErr, Msg: r.seenStages.callTrace()}
 			return r
+		}
+	}
+
+	// Keyed ordering: if this stage is a barrier for this Request's key, block until it is this
+	// sequence's turn before running the stage body. A failed wait (ctx cancelled or teardown) means
+	// the Request does not enter the stage; its sequence is left for the exit hook to resolve, so a
+	// successor is not stranded. barrierBit computes the stage PC, so it is reached only with keyed
+	// ordering on.
+	bit, gated := 0, false
+	if p.keyOrder != nil && r.ks != nil {
+		if b, ok := p.keyOrder.barrierBit(stage, r.clearedMask); ok {
+			bit, gated = b, true
+			// Record the wait: parked is a gauge of workers blocked at a barrier right now, and the
+			// wait duration folds into the barrier min/avg/max.
+			p.stats.parked.Add(1)
+			waitStart := time.Now()
+			err := r.ks.seqs[b].Wait(r.Ctx, r.seq)
+			p.stats.recordBarrierWait(time.Since(waitStart))
+			p.stats.parked.Add(-1)
+			if err != nil {
+				r.Err = classifyWaitErr(err)
+				return r
+			}
+			// The predecessor we waited on may have failed and poisoned the key while we were parked.
+			if p.keyOrder.stopKeyOnErr && r.ks.poisonedBefore(r.seq) {
+				r.Err = ErrKeyFailed
+				return r
+			}
 		}
 	}
 
@@ -912,6 +1108,46 @@ func (p *pipeline[T]) execStage(r Request[T], stage Stage[T]) (out Request[T]) {
 			return r
 		}
 	}
+	r = p.callStage(stage, r)
+
+	// Release the barrier as soon as the stage body has run, so the key's next Request may enter this
+	// stage while this one moves on. A stage that set r.Err still ran, so it still releases here; a
+	// preProcessor error above returns first and leaves the barrier for the exit hook to resolve.
+	if gated {
+		// If the stage failed, poison the key before releasing the barrier, so the next Request waiting
+		// on it wakes to a poisoned key and is skipped rather than proceeding (WithStopKeyOnErr).
+		if r.Err != nil && p.keyOrder.stopKeyOnErr {
+			r.ks.poison(r.seq)
+		}
+		r.ks.seqs[bit].Done(r.seq)
+		r.clearedMask |= uint64(1) << uint(bit)
+	}
+	return r
+}
+
+// onPanic records the first stage panic and starts teardown. First panic wins; later panics during
+// teardown are dropped. On the first, every live barrier waiter is woken (abortAll) so no worker is
+// left blocked, and thereafter execStage fast-drains the remaining Requests.
+func (p *pipeline[T]) onPanic(rec any, stack []byte) {
+	if p.panicked.CompareAndSwap(nil, &PanicError{Value: rec, Stack: stack}) {
+		if p.keyOrder != nil {
+			p.keyOrder.abortAll()
+		}
+	}
+}
+
+// callStage runs a single stage body under a recover so a panic in user code does not crash the
+// process. On a panic it records the origin (onPanic) and returns the Request carrying ErrTornDown;
+// the real panic is re-raised later from RequestGroup.Close. The recover runs before processReq's
+// exit hook, so abortAll happens before any barrier is released and no waiter slips through.
+func (p *pipeline[T]) callStage(stage Stage[T], r Request[T]) (out Request[T]) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			p.onPanic(rec, debug.Stack())
+			out = r
+			out.Err = ErrTornDown
+		}
+	}()
 	return stage(r)
 }
 
