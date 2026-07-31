@@ -99,12 +99,12 @@ func ExampleLimited_promise() {
 	words := []string{"go", "fan", "out"}
 
 	maker := promises.Maker[string, int]{}
-	proms := make([]promises.Promise[string, int], len(words))
+	proms := make([]promises.Value[string, int], len(words))
 	for i, w := range words {
 		proms[i] = maker.New(ctx, w)
 	}
 
-	fn := func(ctx context.Context, _ int, p promises.Promise[string, int]) error {
+	fn := func(ctx context.Context, _ int, p promises.Value[string, int]) error {
 		p.Set(ctx, len(p.In), nil) // resolve the Promise with the length of its input.
 		return nil
 	}

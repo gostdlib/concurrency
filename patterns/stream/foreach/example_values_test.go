@@ -139,13 +139,13 @@ func ExampleItem_promise() {
 	ctx := context.Background()
 
 	maker := promises.Maker[int, int]{}
-	proms := make([]promises.Promise[int, int], 3)
+	proms := make([]promises.Value[int, int], 3)
 	for i := range proms {
 		proms[i] = maker.New(ctx, i+1)
 	}
 
 	// Submit each Promise into the pipeline on a background worker.
-	pipeline := make(chan promises.Promise[int, int])
+	pipeline := make(chan promises.Value[int, int])
 	context.Pool(ctx).Submit(ctx, func() {
 		defer close(pipeline)
 		for _, p := range proms {
@@ -153,7 +153,7 @@ func ExampleItem_promise() {
 		}
 	})
 
-	fn := func(ctx context.Context, _ int, p promises.Promise[int, int]) (struct{}, error) {
+	fn := func(ctx context.Context, _ int, p promises.Value[int, int]) (struct{}, error) {
 		p.Set(ctx, p.In*p.In, nil) // resolve the Promise with the square of its input.
 		return struct{}{}, nil
 	}

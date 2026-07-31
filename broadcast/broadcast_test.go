@@ -409,8 +409,7 @@ func TestMetricsNoDrift(t *testing.T) {
 		steadySubs  = 16
 	)
 
-	ctx := t.Context()
-	reader := metricReader(t)
+	ctx, reader := metricReader(t, t.Context())
 
 	// The Name is what turns metrics on. Without it there is nothing to drift and this test proves nothing.
 	v := &Value[int]{Name: "test"}

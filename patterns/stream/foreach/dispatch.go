@@ -10,8 +10,8 @@ import (
 	"github.com/gostdlib/base/concurrency/worker"
 	"github.com/gostdlib/base/context"
 	"github.com/gostdlib/base/retry/exponential"
+	"github.com/gostdlib/base/telemetry/otel/trace/span"
 	"github.com/gostdlib/concurrency/patterns/stream"
-	"github.com/gostdlib/internals/otel/span"
 )
 
 // dispatcher runs the fan-out side of Item: a puller goroutine ranges seq and hands pairs over, a
@@ -162,7 +162,7 @@ loop:
 			// The checkpoint fails on cancellation (routine) or an internal invariant breach; only
 			// the latter is worth recording.
 			if ctx.Err() == nil {
-				spanner.Error(err)
+				spanner.Span.RecordError(err)
 			}
 			break
 		}
@@ -206,7 +206,7 @@ loop:
 	// Errors already reached the consumer in-band as Response.Err; the span records them for
 	// observability.
 	if err := g.Wait(ctx); err != nil {
-		spanner.Error(err)
+		spanner.Span.RecordError(err)
 	}
 	// Sweep the ledger: entries left are pairs whose fn never ran (their submit was declined or their
 	// Group execution skipped after ctx was cancelled). Deliver a cancellation Response for each so the
