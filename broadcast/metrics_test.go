@@ -5,21 +5,20 @@ import (
 	"testing"
 
 	"github.com/gostdlib/base/context"
-	baseMetrics "github.com/gostdlib/base/telemetry/otel/metrics"
 
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
-// metricReader wires a Context to a fresh ManualReader-backed MeterProvider so a test can read the metrics a
-// named Value emits. It returns the Context to pass to the Value and the reader to collect from.
-func metricReader(t *testing.T) *sdkmetric.ManualReader {
+// metricReader wires ctx to a fresh ManualReader-backed MeterProvider so a test can read the metrics a
+// named Value emits. The provider rides the returned Context rather than the process-global default, which
+// is what keeps parallel tests from stomping each other's provider or racing the global's readers.
+func metricReader(t *testing.T, ctx context.Context) (context.Context, *sdkmetric.ManualReader) {
 	t.Helper()
 
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	baseMetrics.Set(mp)
-	return reader
+	return context.SetMeterProvider(ctx, mp), reader
 }
 
 // instruments are every metric this package records. A counter that has never been added to is not exported
@@ -101,8 +100,7 @@ func TestMetrics(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		ctx := t.Context()
-		reader := metricReader(t)
+		ctx, reader := metricReader(t, t.Context())
 
 		v := &Value[int]{Name: "test"}
 
@@ -141,8 +139,7 @@ func TestMetrics(t *testing.T) {
 func TestMetricsPending(t *testing.T) {
 	t.Parallel()
 
-	ctx := t.Context()
-	reader := metricReader(t)
+	ctx, reader := metricReader(t, t.Context())
 
 	v := &Value[int]{Name: "test"}
 	next, stop := iter.Pull(v.Subscribe(ctx))

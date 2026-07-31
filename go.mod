@@ -7,7 +7,7 @@ require github.com/johnsiilver/pools v0.0.0-20221216174331-e94bf08bc72b // indir
 require (
 	github.com/fsnotify/fsnotify v1.8.0 // indirect
 	github.com/google/btree v1.1.3 // indirect
-	github.com/gostdlib/base v0.0.0-20260701180745-9440ac4633af
+	github.com/gostdlib/base v0.0.0-20260731185134-898f5f5af870
 	github.com/gostdlib/db v0.0.0-20260620062003-edece78954cd
 	github.com/hashicorp/hcl v1.0.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
@@ -41,7 +41,6 @@ require (
 	github.com/cenkalti/backoff v2.2.1+incompatible
 	github.com/go-json-experiment/json v0.0.0-20250725192818-e39067aee2d2
 	github.com/google/uuid v1.6.0
-	github.com/gostdlib/internals v0.0.0-20240319155855-57c259c0554f
 	github.com/jackc/pgconn v1.14.3
 	github.com/jackc/pgx/v4 v4.18.3
 	github.com/jmoiron/sqlx v1.4.0
