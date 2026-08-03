@@ -358,10 +358,9 @@ func TestItemPanicOnBreak(t *testing.T) {
 }
 
 // TestItemLimitedPool verifies a run makes progress when ctx carries a worker pool limited to a single
-// slot. A run must need at most one pool slot (the lanes run on the sync.Group's own goroutines, not
-// the pool), so it cannot wedge on a second Submit that blocks before delivery starts draining. The
-// input is larger than the lane and output buffers, so a run that needed two concurrent slots would
-// hang. Both lane strategies are covered.
+// slot. A run needs no pool slot at all: the coordinator runs on the default pool and the lanes run on
+// the sync.Group's own goroutines. The input is larger than the lane and output buffers, so a run that
+// needed a slot per stage would hang. Both lane strategies are covered.
 func TestItemLimitedPool(t *testing.T) {
 	t.Parallel()
 
@@ -406,5 +405,69 @@ func TestItemLimitedPool(t *testing.T) {
 		case <-time.After(15 * time.Second):
 			t.Fatalf("TestItemLimitedPool(%s): timed out — deadlock under a single-slot pool", test.name)
 		}
+	}
+}
+
+// TestItemSaturatedPool verifies a run completes when the Context carries a Limited pool whose every
+// slot is already held by unrelated work. The coordinator runs on the default pool and the lanes run on
+// the sync.Group's own goroutines, so a run consumes none of the caller's limit and a saturated pool
+// cannot stall it. Submitting the coordinator to the Context's pool wedged here: it parked in the slot
+// acquire on a Context that cannot be cancelled, so no pair was ever dispatched and no result ever
+// delivered. Both lane strategies are covered.
+func TestItemSaturatedPool(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		opts []keyed.Option
+	}{
+		{name: "Success: fixed lanes finish under a fully held pool", opts: []keyed.Option{keyed.WithFixedLanes(2)}},
+		{name: "Success: per-key lanes finish under a fully held pool", opts: perKeyOpts()},
+	}
+
+	for _, test := range tests {
+		base := t.Context()
+
+		// Hold the only slot of a Limited(1) pool for the whole case, so anything the run submitted to the
+		// Context's pool would park in the slot acquire with no slot ever coming free.
+		limited := context.Pool(base).Limited(base, "keyedsaturated", 1)
+		release := make(chan struct{})
+		held := make(chan struct{})
+		limited.Submit(base, func() {
+			close(held)
+			<-release
+		})
+		<-held // The blocker now owns the only slot.
+		lctx := context.SetPool(base, limited)
+
+		keys := []string{"a", "b", "c", "d"}
+		var in []item
+		for i := 0; i < 100; i++ {
+			in = append(in, item{Key: keys[i%len(keys)], N: i})
+		}
+		fn := func(ctx context.Context, _ int, it item) (int, error) { return it.N, nil }
+
+		done := make(chan int, 1)
+		// Run the consumer on the unconstrained base pool so this test goroutine stays free to time out.
+		context.Pool(base).Submit(base, func() {
+			count := 0
+			for _, resp := range keyed.Item(lctx, stream.Slice(in), itemKey, fn, test.opts...) {
+				if resp.Err != nil {
+					t.Errorf("TestItemSaturatedPool(%s): got err == %s, want nil", test.name, resp.Err)
+				}
+				count++
+			}
+			done <- count
+		})
+
+		select {
+		case count := <-done:
+			if count != len(in) {
+				t.Errorf("TestItemSaturatedPool(%s): got %d results, want %d", test.name, count, len(in))
+			}
+		case <-time.After(15 * time.Second):
+			t.Errorf("TestItemSaturatedPool(%s): timed out — the run wedged on a saturated pool", test.name)
+		}
+		close(release)
 	}
 }

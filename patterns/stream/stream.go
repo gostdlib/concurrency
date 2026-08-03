@@ -11,7 +11,10 @@ common data sources into one:
 For example, to process each value received on a channel in parallel and stream the results back:
 
 	ch := make(chan int, 1)
-	context.Pool(ctx).Submit(ctx, func() {
+	// Feed on the default pool, via Pool.Default(), rather than the Context's pool, which may be Limited:
+	// a feeder holding a limited slot blocks the very work that drains the channel it is filling, and on a
+	// small enough limit the two deadlock.
+	context.Pool(ctx).Default().Submit(ctx, func() {
 		defer close(ch)
 		for i := 0; i < 10; i++ {
 			select {

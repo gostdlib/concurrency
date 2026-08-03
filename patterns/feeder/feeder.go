@@ -267,11 +267,16 @@ func NewFeeder[K cmp.Ordered, V any](ctx context.Context, v Value[K, V], options
 // Feed takes an input pipeline and starts feeding it into the Feeder's Value. This can be called multiple times for
 // different pipe constructors you want to feed into our value. When the feed is done, finished will return an error
 // or nil. This starts 1 goroutine per Feed call. Consider ShardedMap Value if doing many feeds.
+//
+// The pump runs on the default pool, never the Context's pool, which may be Limited: a feeder that had to win a
+// limited slot would wait behind the very Workers it feeds, and against a saturated pool it would never start while
+// the caller blocked on finished forever. Submitting on a WithoutCancel ctx means the pool never declines the pump,
+// so finished always receives exactly one terminal value; the pump honors cancellation through the captured ctx.
 func (f *Feeder[K, V]) Feed(ctx context.Context, pipe KVPipeline[K, V]) (finished chan error) {
 	finished = make(chan error, 1)
 
-	_ = context.Tasks(ctx).Once(ctx, "feeder", func(ctx context.Context) error {
-		return f.pump(ctx, pipe, finished)
+	_ = context.Pool(ctx).Default().Submit(context.WithoutCancel(ctx), func() {
+		f.pump(ctx, pipe, finished)
 	})
 
 	return finished
@@ -280,7 +285,7 @@ func (f *Feeder[K, V]) Feed(ctx context.Context, pipe KVPipeline[K, V]) (finishe
 // pump establishes the pipeline and feeds it into the Value until it completes or errors. With a retry policy set,
 // a retryable error re-establishes the pipeline via the backoff while an error wrapping ErrPermanent stops it. pump
 // owns finished: it sends the terminal result and closes finished exactly once.
-func (f *Feeder[K, V]) pump(ctx context.Context, pipe KVPipeline[K, V], finished chan error) error {
+func (f *Feeder[K, V]) pump(ctx context.Context, pipe KVPipeline[K, V], finished chan error) {
 	var err error
 	if f.back == nil {
 		err = f.attempt(ctx, pipe)
@@ -291,7 +296,6 @@ func (f *Feeder[K, V]) pump(ctx context.Context, pipe KVPipeline[K, V], finished
 	}
 	finished <- err
 	close(finished)
-	return err
 }
 
 // attempt establishes the pipeline once and feeds it into the Value until the pipe closes or an error occurs.

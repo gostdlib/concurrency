@@ -87,6 +87,8 @@ github.com/gostdlib/base v0.0.0-20260731171159-e65ae111ce3c h1:wDa+rWLgIu0q0ixBf
 github.com/gostdlib/base v0.0.0-20260731171159-e65ae111ce3c/go.mod h1:6ATzKXqpEiNiFOnTbQqlu+RDf3A3Zpa2dGqennppFGk=
 github.com/gostdlib/base v0.0.0-20260731185134-898f5f5af870 h1:ucR0Y2hLu74quEF06A9gfBzEwLJijf1kHsMeQnxs5zs=
 github.com/gostdlib/base v0.0.0-20260731185134-898f5f5af870/go.mod h1:6ATzKXqpEiNiFOnTbQqlu+RDf3A3Zpa2dGqennppFGk=
+github.com/gostdlib/base v0.0.0-20260802170211-f46987c5dccd h1:MDXHxceOQColPJxcFsTLqI7HLZtsmTIhki0a+ezePpI=
+github.com/gostdlib/base v0.0.0-20260802170211-f46987c5dccd/go.mod h1:6ATzKXqpEiNiFOnTbQqlu+RDf3A3Zpa2dGqennppFGk=
 github.com/gostdlib/db v0.0.0-20260620062003-edece78954cd h1:7hhU/p+BgbVJElYMKKizflVZ4hkhdp3uii876hEbCJY=
 github.com/gostdlib/db v0.0.0-20260620062003-edece78954cd/go.mod h1:vRYrFe29pTQlx9y139n0TyRt6KD6X1ILIRsOqHX/9uk=
 github.com/gostdlib/deps v0.0.0-20260618182714-aa0489fb9f69 h1:kSiC8kOqkSb5FNT+fiIqIQXS/NHJUgSNtFua1yZ9tK4=

@@ -334,7 +334,7 @@ func TestWithOrderedKeys(t *testing.T) {
 }
 
 // TestItemLimitedPool proves Item completes on a pool with a single worker slot: the coordinators run
-// as background tasks, so they cannot starve the ItemFuncs of pool slots (this deadlocked when the
+// on the default pool, so they cannot starve the ItemFuncs of pool slots (this deadlocked when the
 // dispatcher occupied a slot on the same pool).
 func TestItemLimitedPool(t *testing.T) {
 	t.Parallel()

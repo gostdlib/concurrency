@@ -110,8 +110,9 @@ func ExampleItem_result() {
 		return v * v, nil
 	}
 
-	// Run foreach on a background worker, funneling each result into its result.Value as it completes.
-	context.Pool(ctx).Submit(ctx, func() {
+	// Run foreach on the default pool, funneling each result into its result.Value as it completes. The
+	// default pool is never Limited, so this driver cannot take a slot from the ItemFuncs it drives.
+	context.Pool(ctx).Default().Submit(ctx, func() {
 		for k, resp := range foreach.Item(ctx, stream.Slice(nums), fn) {
 			results[k].Set(resp.V, resp.Err) // Set is called at most once per Value.
 		}
@@ -144,9 +145,10 @@ func ExampleItem_promise() {
 		proms[i] = maker.New(ctx, i+1)
 	}
 
-	// Submit each Promise into the pipeline on a background worker.
+	// Submit each Promise into the pipeline on the default pool, which is never Limited, so this feeder
+	// cannot take a slot from the ItemFuncs draining the pipeline it fills.
 	pipeline := make(chan promises.Value[int, int])
-	context.Pool(ctx).Submit(ctx, func() {
+	context.Pool(ctx).Default().Submit(ctx, func() {
 		defer close(pipeline)
 		for _, p := range proms {
 			pipeline <- p

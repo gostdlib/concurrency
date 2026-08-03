@@ -9,7 +9,9 @@ Limited fans w out over any iter.Seq2. Adapt a channel, slice, or map into one w
 stream.Slice, or stream.Map. It returns a channel that is closed once every pair has been processed:
 
 	ch := make(chan int)
-	context.Pool(ctx).Submit(ctx, func() {
+	// Feed on the default pool, via Pool.Default(), rather than the Context's pool, which may be Limited:
+	// a feeder holding a limited slot blocks the very Workers that drain the channel it is filling.
+	context.Pool(ctx).Default().Submit(ctx, func() {
 		defer close(ch)
 		for i := 0; i < 100; i++ {
 			ch <- i
@@ -34,7 +36,6 @@ import (
 	"fmt"
 	"iter"
 
-	"github.com/gostdlib/base/concurrency/worker"
 	"github.com/gostdlib/base/context"
 	"github.com/gostdlib/base/retry/exponential"
 	"github.com/gostdlib/concurrency/patterns/stream/foreach"
@@ -126,7 +127,7 @@ func Limited[K, V any](ctx context.Context, name string, size int, seq iter.Seq2
 	// consumes one of size's slots (a size-1 pool would otherwise deadlock against its own driver).
 	// The driver runs on the WithoutCancel ctx so Submit never declines; that is what lets us drop the
 	// close-on-decline fallback and still guarantee done always closes.
-	_ = worker.Default().Submit(ctx, func() {
+	_ = context.Pool(ctx).Default().Submit(ctx, func() {
 		for range foreach.Item(poolCtx, seq, fn, opts...) {
 		}
 		close(d)
