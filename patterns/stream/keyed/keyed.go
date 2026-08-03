@@ -385,15 +385,16 @@ func (r run[K, V, R]) fixedLanes(n int) Seq[K, R] {
 		}
 
 		// One coordinator goroutine dispatches every pair, closes the inboxes, waits for the lanes, then
-		// closes out. Dispatch and close are merged into a single Submit so a run needs only one pool
-		// slot: a second Submit would block before deliver starts draining under a Limited pool, wedging
-		// the run once the buffers fill. The lanes run on g's own goroutines (a sync.Group with no Pool),
-		// not the pool, so they need no slot. The seed is fixed for the run, so a key always maps to the
-		// same lane. Submitted on a WithoutCancel ctx so Submit never declines; the closure honors
-		// cancellation through the captured ctx.
+		// closes out. It runs on the default pool, never the Context's pool, which may be Limited: the
+		// coordinator lives for the whole run, so a slot it held would be one fewer slot for real work, and
+		// against an already-saturated Limited pool it would wait for a slot that never frees while the run
+		// delivered nothing. The lanes run on g's own goroutines (a sync.Group with no Pool), so they need
+		// no slot either — a keyed run consumes none of the caller's limit. The seed is fixed for the run,
+		// so a key always maps to the same lane. Submitted on a WithoutCancel ctx so Submit never declines;
+		// the closure honors cancellation through the captured ctx.
 		seed := maphash.MakeSeed()
 		submitCtx := context.WithoutCancel(ctx)
-		_ = context.Pool(ctx).Submit(submitCtx, func() {
+		_ = context.Pool(ctx).Default().Submit(submitCtx, func() {
 			dispatch := func() {
 				// Closing every inbox on the way out ends the lanes whether the input was exhausted or ctx
 				// was cancelled, so it must run before the g.Wait below.
@@ -467,14 +468,15 @@ func (r run[K, V, R]) perKeyLanes(idle time.Duration) Seq[K, R] {
 		submitCtx := context.WithoutCancel(ctx)
 
 		// One coordinator goroutine dispatches every pair, closes the live lanes' inboxes, waits for the
-		// lanes, then closes out. Dispatch and close are merged into a single Submit so a run needs only
-		// one pool slot: a second Submit would block before deliver starts draining under a Limited pool,
-		// wedging the run once the buffers fill. The lanes run on g's own goroutines (a sync.Group with no
-		// Pool), not the pool, so they need no slot. Every g.Go therefore happens before the g.Wait below,
-		// on this one goroutine. The dispatcher get-or-creates a lane per key and hands it the pair;
-		// inflight is bumped under mu before the send so a concurrent reap sees the reservation and keeps
-		// the lane alive.
-		_ = context.Pool(ctx).Submit(submitCtx, func() {
+		// lanes, then closes out. It runs on the default pool, never the Context's pool, which may be
+		// Limited: the coordinator lives for the whole run, so a slot it held would be one fewer slot for
+		// real work, and against an already-saturated Limited pool it would wait for a slot that never
+		// frees while the run delivered nothing. The lanes run on g's own goroutines (a sync.Group with no
+		// Pool), so they need no slot either — a keyed run consumes none of the caller's limit. Every g.Go
+		// therefore happens before the g.Wait below, on this one goroutine. The dispatcher get-or-creates a
+		// lane per key and hands it the pair; inflight is bumped under mu before the send so a concurrent
+		// reap sees the reservation and keeps the lane alive.
+		_ = context.Pool(ctx).Default().Submit(submitCtx, func() {
 			dispatch := func() {
 				seq := 0
 				for k, v := range r.in {

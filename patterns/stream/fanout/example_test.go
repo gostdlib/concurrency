@@ -46,7 +46,9 @@ func ExampleLimited_channel() {
 	ctx := context.Background()
 
 	ch := make(chan string)
-	context.Pool(ctx).Submit(ctx, func() {
+	// Feed on the default pool, which is never Limited, so the feeder cannot take a slot from the Workers
+	// draining the channel it fills.
+	context.Pool(ctx).Default().Submit(ctx, func() {
 		defer close(ch)
 		for _, s := range []string{"a", "b", "c"} {
 			ch <- s

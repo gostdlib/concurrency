@@ -20,7 +20,10 @@
 //	if err != nil {
 //		// Handle error.
 //	}
-//	context.Pool(ctx).Submit(ctx, func() {
+//	// Consume on the default pool, via Pool.Default(), rather than the Context's pool, which may be
+//	// Limited: a subscriber lives as long as the subscription, so a limited slot it took would be held
+//	// for that whole time instead of doing work.
+//	context.Pool(ctx).Default().Submit(ctx, func() {
 //		for value := range seq {
 //			fmt.Println(value)
 //		}

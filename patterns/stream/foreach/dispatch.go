@@ -2,10 +2,8 @@ package foreach
 
 import (
 	"errors"
-	"fmt"
 	"iter"
 
-	"github.com/gostdlib/base/concurrency/background"
 	"github.com/gostdlib/base/concurrency/sync"
 	"github.com/gostdlib/base/concurrency/worker"
 	"github.com/gostdlib/base/context"
@@ -15,8 +13,8 @@ import (
 )
 
 // dispatcher runs the fan-out side of Item: a puller goroutine ranges seq and hands pairs over, a
-// dispatch goroutine runs fn on the pool for each pair and hands every response to deliver. Both run
-// as background tasks (worker.Default's unbounded pool), never on the possibly-Limited pool the
+// dispatch goroutine runs fn on the pool for each pair and hands every response to deliver. Both run on
+// the default pool (worker.Pool.Default's unbounded pool), never on the possibly-Limited pool the
 // ItemFuncs use — a coordinator occupying a worker slot deadlocks a Limit(1) pool and steals a worker
 // from every other.
 type dispatcher[K, V, R any] struct {
@@ -39,49 +37,27 @@ type dispatcher[K, V, R any] struct {
 	workers *worker.Pool
 }
 
-// launch starts Item's fan-out and returns at once: it takes a Tasks manager (the caller passes the
-// Context's) and submits the puller (pullSeq) and the dispatch loop (run) as two one-shot background tasks, off that manager
-// rather than the possibly-Limited ItemFunc pool so a coordinator never occupies a worker slot. It
-// runs once per range, on the range goroutine; the caller then ranges the delivery side and joins on
-// d.done.
+// launch starts Item's fan-out and returns at once: it submits the puller (pullSeq) and the dispatch
+// loop (run) to the default pool rather than the possibly-Limited ItemFunc pool, so a coordinator never
+// occupies a worker slot. It runs once per range, on the range goroutine; the caller then ranges the
+// delivery side and joins on d.done.
 //
-// On the normal path run owns teardown — pullSeq closes d.pull, and run calls d.finish then closes
-// d.done — so launch only has to cover a task that fails to start. A failed start must not vanish:
-// with nothing delivered, a dispatch that did start drains the (closed) pull and finishes with zero
-// responses, a run indistinguishable from empty input. That is the silent-empty-range hazard, and each
-// branch closes it. If the puller fails to start, launch closes d.pull in its place and, while ctx is
-// alive, delivers exactly one in-band Response wrapping ErrPermanent — permanent because a Tasks
-// manager that will not start (a Closed one) does not recover on a retry, matching how invalid options
-// report. If the dispatcher fails to start, run is not there to finish or close done, so launch calls
-// d.finish and closes d.done itself, and reports the same in-band ErrPermanent unless the puller branch
-// already did — the reported guard stops one Closed manager, which fails both Once calls, from
-// double-delivering.
-//
-// A start failure while ctx is already cancelled delivers nothing on purpose: the caller tells a
-// truncated run from a complete one by checking ctx.Err() after the range, so an in-band error there
-// would misattribute cancellation to a startup fault.
-func (d *dispatcher[K, V, R]) launch(ctx context.Context, tasks *background.Tasks) {
-	reported := false
-	if err := tasks.Once(ctx, "pull", func(ctx context.Context) error { d.pullSeq(ctx); return nil }); err != nil {
-		close(d.pull)
-		// Mirror the dispatch-failure branch: a non-ctx pull-startup failure must surface in-band, or a
-		// dispatch that then drains the closed pull finishes with no response and the run looks identical
-		// to empty input. (Not reachable today: the only failure mode, a Closed Tasks manager, fails both
-		// Once calls, so this is contract-hardening; the reported flag stops it double-delivering.)
-		if ctx.Err() == nil {
-			var zero K
-			d.deliver(0, zero, stream.Result[R]{Err: fmt.Errorf("foreach: could not start pull: %w: %w", err, ErrPermanent)})
-			reported = true
-		}
-	}
-	if err := tasks.Once(ctx, "dispatch", func(ctx context.Context) error { d.run(ctx); return nil }); err != nil {
-		if ctx.Err() == nil && !reported {
-			var zero K
-			d.deliver(0, zero, stream.Result[R]{Err: fmt.Errorf("foreach: could not start dispatch: %w: %w", err, ErrPermanent)})
-		}
-		d.finish()
-		close(d.done)
-	}
+// run owns teardown on every path — pullSeq closes d.pull, and run calls d.finish then closes d.done —
+// which holds because neither submit can be declined. A coordinator that failed to start would be the
+// silent-empty-range hazard: with nothing delivered and d.done closed, a dispatch that did start would
+// drain the (closed) pull and finish with zero responses, a run indistinguishable from empty input.
+// Two properties remove that failure mode rather than reporting it. The default pool is never Limited,
+// so there is no slot to wait for, and the WithoutCancel submit Context is never cancelled, so the pool
+// never declines the job. The coordinators still honor cancellation through the captured ctx: an
+// already-cancelled ctx ends the run promptly with no responses, which a caller tells from a complete
+// run by checking ctx.Err() after the range.
+func (d *dispatcher[K, V, R]) launch(ctx context.Context) {
+	// Default() returns the process-wide unlimited pool whichever pool it is called on, so this is the
+	// ItemFunc pool's own handle to the pool the coordinators must not take slots from.
+	p := d.workers.Default()
+	submitCtx := context.WithoutCancel(ctx)
+	_ = p.Submit(submitCtx, func() { d.pullSeq(ctx) })
+	_ = p.Submit(submitCtx, func() { d.run(ctx) })
 }
 
 // call runs fn for a pair; under WithGate every attempt runs inside the backoff, and the gate closes

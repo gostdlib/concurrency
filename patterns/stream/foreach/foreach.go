@@ -305,7 +305,7 @@ func unorderedSeq[K, V, R any](ctx context.Context, seq iter.Seq2[K, V], fn Item
 			},
 			finish: func() { close(out) },
 		}
-		d.launch(ctx, context.Tasks(ctx))
+		d.launch(ctx)
 		// The join: returning from the range — normally or by breaking — releases blocked senders,
 		// cancels remaining work and waits for the dispatched ItemFuncs to finish, so their side
 		// effects happen before the range returns.
@@ -355,7 +355,7 @@ func orderedSeq[K, V, R any](ctx context.Context, seq iter.Seq2[K, V], fn ItemFu
 			},
 			finish: ord.finish,
 		}
-		d.launch(ctx, context.Tasks(ctx))
+		d.launch(ctx)
 		// The join: returning from the range — normally or by breaking — cancels remaining work and
 		// waits for the dispatched ItemFuncs to finish, so their side effects happen before the range
 		// returns.
