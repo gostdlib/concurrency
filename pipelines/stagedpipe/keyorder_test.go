@@ -3,6 +3,7 @@ package stagedpipe
 import (
 	"fmt"
 	"math/rand"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,6 +40,25 @@ func (s *koSM) B(r Request[koData]) Request[koData] {
 func (s *koSM) Close() {}
 
 func koKey(d koData) string { return d.Key }
+
+// wantKeyOrder asserts that a stage saw exactly perKey Requests for every key, in submit order. got
+// maps a key to the Request numbers the stage observed for it; the caller reads it only after the
+// Pipelines is closed, so no lock is needed.
+func wantKeyOrder(t *testing.T, testName string, keys []string, perKey int, got map[string][]int) {
+	t.Helper()
+
+	for _, k := range keys {
+		obs := got[k]
+		if len(obs) != perKey {
+			t.Fatalf("%s(key %s): got %d observations, want %d", testName, k, len(obs), perKey)
+		}
+		for i, n := range obs {
+			if n != i {
+				t.Fatalf("%s(key %s): observation %d == %d, want %d (out of order): %v", testName, k, i, n, i, obs)
+			}
+		}
+	}
+}
 
 // TestNewKeyed pins the keyed-ordering configuration resolved by New: WithKey and WithOrderedStages
 // must appear together, ordered stages resolve to a deduplicated barrier set, and WithStopKeyOnErr
@@ -136,7 +156,7 @@ func TestNewKeyed(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		p, err := New[koData]("test", 1, sm, test.options...)
+		p, err := New[koData](t.Context(), "test", 1, sm, test.options...)
 		switch {
 		case err == nil && test.wantErr:
 			t.Errorf("TestNewKeyed(%s): got err == nil, want err != nil", test.name)
@@ -152,7 +172,7 @@ func TestNewKeyed(t *testing.T) {
 			t.Errorf("TestNewKeyed(%s): got (keyOrder != nil) == %v, want %v", test.name, gotKeyOrder, test.wantKeyOrder)
 		}
 		if test.wantKeyOrder && p.keyOrder != nil {
-			if got := len(p.keyOrder.barrierIdx); got != test.wantBarriers {
+			if got := p.keyOrder.barrierIdx.Len(); got != test.wantBarriers {
 				t.Errorf("TestNewKeyed(%s): got %d barriers, want %d", test.name, got, test.wantBarriers)
 			}
 			if got := p.keyOrder.stopKeyOnErr; got != test.wantStopKeyOnErr {
@@ -214,18 +234,13 @@ func TestKeyedOrdering(t *testing.T) {
 
 	sm := &ordSM{perKey: perKey, unit: 500 * time.Microsecond, recorded: map[string][]int{}}
 
-	p, err := New[ordData]("keyed", 6, sm, WithKey(ordKey), WithOrderedStages(sm.Work))
+	p, err := New[ordData](t.Context(), "keyed", 6, sm, WithKey(ordKey), WithOrderedStages(sm.Work))
 	if err != nil {
 		t.Fatalf("TestKeyedOrdering: New: %s", err)
 	}
 
 	rg := p.NewRequestGroup()
-	done := make(chan struct{})
-	context.Pool(t.Context()).Submit(t.Context(), func() {
-		defer close(done)
-		for range rg.Out() {
-		}
-	})
+	done := drain(t.Context(), rg)
 
 	ctx := t.Context()
 	for n := 0; n < perKey; n++ {
@@ -240,17 +255,7 @@ func TestKeyedOrdering(t *testing.T) {
 	<-done
 	p.Close()
 
-	for _, k := range keys {
-		got := sm.recorded[k]
-		if len(got) != perKey {
-			t.Fatalf("TestKeyedOrdering(key %s): got %d observations, want %d", k, len(got), perKey)
-		}
-		for i, n := range got {
-			if n != i {
-				t.Fatalf("TestKeyedOrdering(key %s): observation %d == %d, want %d (out of order): %v", k, i, n, i, got)
-			}
-		}
-	}
+	wantKeyOrder(t, "TestKeyedOrdering", keys, perKey, sm.recorded)
 }
 
 // TestKeyedReap verifies that a key's state is reclaimed once its last in-flight Request exits, so a
@@ -260,18 +265,13 @@ func TestKeyedReap(t *testing.T) {
 
 	sm := &ordSM{perKey: 1, unit: 0, recorded: map[string][]int{}}
 
-	p, err := New[ordData]("reap", 4, sm, WithKey(ordKey), WithOrderedStages(sm.Work))
+	p, err := New[ordData](t.Context(), "reap", 4, sm, WithKey(ordKey), WithOrderedStages(sm.Work))
 	if err != nil {
 		t.Fatalf("TestKeyedReap: New: %s", err)
 	}
 
 	rg := p.NewRequestGroup()
-	done := make(chan struct{})
-	context.Pool(t.Context()).Submit(t.Context(), func() {
-		defer close(done)
-		for range rg.Out() {
-		}
-	})
+	done := drain(t.Context(), rg)
 
 	ctx := t.Context()
 	// Every Request has a distinct key, so the registry would grow unbounded without reaping.
@@ -341,7 +341,7 @@ func TestKeyedDivergentPaths(t *testing.T) {
 
 	sm := &branchSM{perKey: perKey, unit: 400 * time.Microsecond, workOrder: map[string][]int{}}
 
-	p, err := New[ordData]("branch", 6, sm, WithKey(ordKey), WithOrderedStages(sm.Work))
+	p, err := New[ordData](t.Context(), "branch", 6, sm, WithKey(ordKey), WithOrderedStages(sm.Work))
 	if err != nil {
 		t.Fatalf("TestKeyedDivergentPaths: New: %s", err)
 	}
@@ -426,28 +426,43 @@ func TestPanicTeardown(t *testing.T) {
 		// keys x perKey is the submit grid.
 		keys   []string
 		perKey int
+		// wantPanic says this case's grid actually reaches the panicking Request, so Close must
+		// re-raise. When false nothing panics and Close must return normally.
+		wantPanic bool
 		// wantValue is the expected PanicError.Value; wantStack asserts a non-empty captured stack.
 		wantValue string
 		wantStack bool
 	}{
 		{
-			name:      "Success: non-keyed stage panic re-raises PanicError with value and stack",
+			// The control: identical to the case below except that the panic target key is never
+			// submitted, so no stage ever panics.
+			name:     "Success: a grid that never reaches the panicking Request closes normally",
+			num:      4,
+			panicKey: "zzz",
+			panicN:   3,
+			keys:     []string{"x"},
+			perKey:   20,
+		},
+		{
+			name:      "Error: non-keyed stage panic re-raises PanicError with value and stack",
 			num:       4,
 			panicKey:  "x",
 			panicN:    3,
 			keys:      []string{"x"},
 			perKey:    20,
+			wantPanic: true,
 			wantValue: "boom at x/3",
 			wantStack: true,
 		},
 		{
-			name:      "Success: keyed panic on a key's leader wakes parked barrier waiters and re-raises",
+			name:      "Error: keyed panic on a key's leader wakes parked barrier waiters and re-raises",
 			num:       6,
 			keyed:     true,
 			panicKey:  "a",
 			panicN:    0,
 			keys:      []string{"a", "b", "c"},
 			perKey:    8,
+			wantPanic: true,
 			wantValue: "boom at a/0",
 		},
 	}
@@ -458,16 +473,22 @@ func TestPanicTeardown(t *testing.T) {
 		if test.keyed {
 			opts = []Option{WithKey(ordKey), WithOrderedStages(sm.Work)}
 		}
-		p, err := New[ordData]("panic", test.num, sm, opts...)
+		p, err := New[ordData](t.Context(), "panic", test.num, sm, opts...)
 		if err != nil {
 			t.Fatalf("TestPanicTeardown(%s): New: %s", test.name, err)
 		}
 
 		rg := p.NewRequestGroup()
+		// This drain counts errored Requests rather than discarding them: the control case asserts that
+		// a run with no panic delivers every Request with Err == nil.
+		var drainErrs atomic.Int64
 		done := make(chan struct{})
 		context.Pool(t.Context()).Submit(t.Context(), func() {
 			defer close(done)
-			for range rg.Out() {
+			for out := range rg.Out() {
+				if out.Err != nil {
+					drainErrs.Add(1)
+				}
 			}
 		})
 
@@ -488,6 +509,17 @@ func TestPanicTeardown(t *testing.T) {
 		}()
 		<-done
 		p.Close()
+
+		if !test.wantPanic {
+			if got != nil {
+				t.Errorf("TestPanicTeardown(%s): rg.Close() re-raised %v, want it to return normally", test.name, got)
+				continue
+			}
+			if n := drainErrs.Load(); n != 0 {
+				t.Errorf("TestPanicTeardown(%s): %d Requests drained with an error, want 0", test.name, n)
+			}
+			continue
+		}
 
 		pe, ok := got.(PanicError)
 		if !ok {
@@ -544,7 +576,7 @@ func TestStopKeyOnErr(t *testing.T) {
 	// num exceeds the total Request count so every Request is pulled into a worker at once, and
 	// WithAdmissionDepth(0) keeps the whole cohort admissible — a's leader blocks in Work while a/1..
 	// park behind it and b/* complete — so no Submit blocks and the cohort stays in flight until release.
-	p, err := New[ordData]("stopkey", 16, sm, WithKey(ordKey), WithOrderedStages(sm.Work), WithStopKeyOnErr(), WithAdmissionDepth(0))
+	p, err := New[ordData](t.Context(), "stopkey", 16, sm, WithKey(ordKey), WithOrderedStages(sm.Work), WithStopKeyOnErr(), WithAdmissionDepth(0))
 	if err != nil {
 		t.Fatalf("TestStopKeyOnErr: New: %s", err)
 	}
@@ -663,18 +695,13 @@ func TestAdmissionDepth(t *testing.T) {
 		// a hard invariant regardless of timing.
 		sm := &admitSM{unit: 10 * time.Millisecond, cur: map[string]int{}, max: map[string]int{}}
 		options := append([]Option{WithKey(ordKey), WithOrderedStages(sm.Commit)}, opts...)
-		p, err := New[ordData]("admit", 16, sm, options...)
+		p, err := New[ordData](t.Context(), "admit", 16, sm, options...)
 		if err != nil {
 			t.Fatalf("TestAdmissionDepth: New: %s", err)
 		}
 
 		rg := p.NewRequestGroup()
-		done := make(chan struct{})
-		context.Pool(t.Context()).Submit(t.Context(), func() {
-			defer close(done)
-			for range rg.Out() {
-			}
-		})
+		done := drain(t.Context(), rg)
 
 		ctx := t.Context()
 		for n := 0; n < perKey; n++ {
@@ -737,7 +764,7 @@ func (s *gateSM) Close() {}
 
 // awaitKeyed polls p.Stats().Keyed until pred holds, failing after a generous deadline. It is how the
 // metrics test observes a live gauge while Requests are held blocked.
-func awaitKeyed(t *testing.T, p *Pipelines[ordData], pred func(KeyedStats) bool, desc string) {
+func awaitKeyed(t *testing.T, testName string, p *Pipelines[ordData], pred func(KeyedStats) bool, desc string) {
 	t.Helper()
 	for i := 0; i < 2000; i++ {
 		if pred(p.Stats().Keyed) {
@@ -745,85 +772,85 @@ func awaitKeyed(t *testing.T, p *Pipelines[ordData], pred func(KeyedStats) bool,
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("TestKeyedMetrics: timed out waiting for %s; last = %+v", desc, p.Stats().Keyed)
+	t.Fatalf("TestKeyedMetrics(%s): timed out waiting for %s; last = %+v", testName, desc, p.Stats().Keyed)
 }
 
 // TestKeyedMetrics verifies the KeyedStats gauges move while Requests are blocked and reset once they
-// drain, and that barrier wait time accumulates. Part A holds a key's leader so its successors park
-// at the barrier (ParkedWorkers); Part B does the same with WithAdmissionDepth(1) so its successors
-// wait at Submit for a slot (AdmissionWaiters).
+// drain, and that barrier wait time accumulates. Each case holds a key's leader inside its ordered
+// stage and asserts where its successors pile up: at the barrier when admission is unbounded, or at
+// Submit when the admission depth only allows one Request per key in flight.
 func TestKeyedMetrics(t *testing.T) {
 	t.Parallel()
 
 	ctx := t.Context()
 
-	// Part A: parked workers + barrier wait. WithAdmissionDepth(0) so the held leader's successors all
-	// park at the barrier (rather than some waiting at Submit for a slot) and inline Submit never blocks.
-	smA := &gateSM{gateKey: "a", release: make(chan struct{})}
-	pA, err := New[ordData]("metrics-parked", 16, smA, WithKey(ordKey), WithOrderedStages(smA.Work), WithAdmissionDepth(0))
-	if err != nil {
-		t.Fatalf("TestKeyedMetrics: New (part A): %s", err)
+	tests := []struct {
+		name string
+		// admitDepth is the WithAdmissionDepth value, which decides where a held key's successors wait.
+		admitDepth int
+		keys       []string
+		// gauge selects the KeyedStats field this case is about. It is read both while the leader is
+		// held (expected > 0) and after the drain (expected 0).
+		gauge     func(KeyedStats) int64
+		gaugeName string
+		// wantBarrierWait asserts that barrier wait time accumulated, which only happens when
+		// successors actually reached and parked at the barrier.
+		wantBarrierWait bool
+	}{
+		{
+			name:            "Success: a held key parks its successors at the barrier",
+			admitDepth:      0,
+			keys:            []string{"a", "b"},
+			gauge:           func(k KeyedStats) int64 { return k.ParkedWorkers },
+			gaugeName:       "ParkedWorkers",
+			wantBarrierWait: true,
+		},
+		{
+			name:       "Success: an admission depth of 1 makes successors wait at Submit",
+			admitDepth: 1,
+			keys:       []string{"a"},
+			gauge:      func(k KeyedStats) int64 { return k.AdmissionWaiters },
+			gaugeName:  "AdmissionWaiters",
+		},
 	}
-	rgA := pA.NewRequestGroup()
-	doneA := make(chan struct{})
-	context.Pool(ctx).Submit(ctx, func() {
-		defer close(doneA)
-		for range rgA.Out() {
+
+	for _, test := range tests {
+		sm := &gateSM{gateKey: "a", release: make(chan struct{})}
+		p, err := New[ordData](ctx, test.name, 16, sm, WithKey(ordKey), WithOrderedStages(sm.Work), WithAdmissionDepth(test.admitDepth))
+		if err != nil {
+			t.Fatalf("TestKeyedMetrics(%s): New: %s", test.name, err)
 		}
-	})
-	for n := 0; n < 6; n++ {
-		for _, k := range []string{"a", "b"} {
-			if err := rgA.Submit(Request[ordData]{Ctx: ctx, Data: ordData{Key: k, N: n}}); err != nil {
-				t.Fatalf("TestKeyedMetrics: Submit (part A): %s", err)
+		rg := p.NewRequestGroup()
+		done := drain(ctx, rg)
+
+		// Submit off the main goroutine: with a finite admission depth the held leader blocks later
+		// Submit calls, and the main goroutine has to stay free to watch the gauge move.
+		subDone := make(chan struct{})
+		context.Pool(ctx).Submit(ctx, func() {
+			defer close(subDone)
+			for n := 0; n < 6; n++ {
+				for _, k := range test.keys {
+					if err := rg.Submit(Request[ordData]{Ctx: ctx, Data: ordData{Key: k, N: n}}); err != nil {
+						return
+					}
+				}
 			}
-		}
-	}
-	// a/0 is blocked in Work; a/1.. park at the barrier behind it.
-	awaitKeyed(t, pA, func(k KeyedStats) bool { return k.ParkedWorkers > 0 }, "ParkedWorkers > 0")
-	close(smA.release)
-	rgA.Close()
-	<-doneA
-	pA.Close()
+		})
 
-	if got := pA.Stats().Keyed; got.ParkedWorkers != 0 {
-		t.Errorf("TestKeyedMetrics: after drain ParkedWorkers == %d, want 0", got.ParkedWorkers)
-	}
-	if got := pA.Stats().Keyed; got.BarrierWaitMax <= 0 {
-		t.Errorf("TestKeyedMetrics: BarrierWaitMax == %v, want > 0 (successors waited at the barrier)", got.BarrierWaitMax)
-	}
+		// a/0 is held inside Work; its successors pile up where this case expects them.
+		awaitKeyed(t, test.name, p, func(k KeyedStats) bool { return test.gauge(k) > 0 }, test.gaugeName+" > 0")
+		close(sm.release)
+		<-subDone
+		rg.Close()
+		<-done
+		p.Close()
 
-	// Part B: admission waiters, depth 1. Later Requests block at Submit, so submit from a goroutine.
-	smB := &gateSM{gateKey: "a", release: make(chan struct{})}
-	pB, err := New[ordData]("metrics-admit", 16, smB, WithKey(ordKey), WithOrderedStages(smB.Work), WithAdmissionDepth(1))
-	if err != nil {
-		t.Fatalf("TestKeyedMetrics: New (part B): %s", err)
-	}
-	rgB := pB.NewRequestGroup()
-	doneB := make(chan struct{})
-	context.Pool(ctx).Submit(ctx, func() {
-		defer close(doneB)
-		for range rgB.Out() {
+		if got := test.gauge(p.Stats().Keyed); got != 0 {
+			t.Errorf("TestKeyedMetrics(%s): after drain %s == %d, want 0", test.name, test.gaugeName, got)
 		}
-	})
-	subDone := make(chan struct{})
-	context.Pool(ctx).Submit(ctx, func() {
-		defer close(subDone)
-		for n := 0; n < 6; n++ {
-			if err := rgB.Submit(Request[ordData]{Ctx: ctx, Data: ordData{Key: "a", N: n}}); err != nil {
-				return
-			}
+		if got := p.Stats().Keyed.BarrierWaitMax; test.wantBarrierWait && got <= 0 {
+			t.Errorf("TestKeyedMetrics(%s): BarrierWaitMax == %v, want > 0 (successors waited at the barrier)", test.name, got)
 		}
-	})
-	// a/0 holds the only slot (blocked in Work); a/1's Submit waits for admission.
-	awaitKeyed(t, pB, func(k KeyedStats) bool { return k.AdmissionWaiters > 0 }, "AdmissionWaiters > 0")
-	close(smB.release)
-	<-subDone
-	rgB.Close()
-	<-doneB
-	pB.Close()
-
-	if got := pB.Stats().Keyed; got.AdmissionWaiters != 0 {
-		t.Errorf("TestKeyedMetrics: after drain AdmissionWaiters == %d, want 0", got.AdmissionWaiters)
 	}
 }
 
@@ -838,7 +865,7 @@ func TestKeyedOrderingAutoScale(t *testing.T) {
 	keys := []string{"a", "b", "c"}
 
 	sm := &ordSM{perKey: perKey, unit: 300 * time.Microsecond, recorded: map[string][]int{}}
-	p, err := New[ordData]("autoscale", 2, sm, WithKey(ordKey), WithOrderedStages(sm.Work), WithAutoScale(1, 6))
+	p, err := New[ordData](t.Context(), "autoscale", 2, sm, WithKey(ordKey), WithOrderedStages(sm.Work), WithAutoScale(1, 6))
 	if err != nil {
 		t.Fatalf("TestKeyedOrderingAutoScale: New: %s", err)
 	}
@@ -848,12 +875,7 @@ func TestKeyedOrderingAutoScale(t *testing.T) {
 
 	ctx := t.Context()
 	rg := p.NewRequestGroup()
-	done := make(chan struct{})
-	context.Pool(ctx).Submit(ctx, func() {
-		defer close(done)
-		for range rg.Out() {
-		}
-	})
+	done := drain(ctx, rg)
 
 	// Submit the whole backlog from a goroutine so the main goroutine can force scale-ups while it
 	// processes.
@@ -881,17 +903,7 @@ func TestKeyedOrderingAutoScale(t *testing.T) {
 	<-done
 	p.Close()
 
-	for _, k := range keys {
-		got := sm.recorded[k]
-		if len(got) != perKey {
-			t.Fatalf("TestKeyedOrderingAutoScale(key %s): got %d observations, want %d", k, len(got), perKey)
-		}
-		for i, n := range got {
-			if n != i {
-				t.Fatalf("TestKeyedOrderingAutoScale(%s): observation %d == %d, want %d (reordered): %v", k, i, n, i, got)
-			}
-		}
-	}
+	wantKeyOrder(t, "TestKeyedOrderingAutoScale", keys, perKey, sm.recorded)
 }
 
 // visitKey identifies a Request by (key, N) so loopSM can tell a stage's first visit from its second.
@@ -949,19 +961,14 @@ func TestKeyedRepeatedStage(t *testing.T) {
 	keys := []string{"a", "b"}
 
 	sm := &loopSM{unit: 300 * time.Microsecond, visited: map[visitKey]bool{}, order: map[string][]int{}}
-	p, err := New[ordData]("loop", 6, sm, WithKey(ordKey), WithOrderedStages(sm.Work))
+	p, err := New[ordData](t.Context(), "loop", 6, sm, WithKey(ordKey), WithOrderedStages(sm.Work))
 	if err != nil {
 		t.Fatalf("TestKeyedRepeatedStage: New: %s", err)
 	}
 
 	ctx := t.Context()
 	rg := p.NewRequestGroup()
-	done := make(chan struct{})
-	context.Pool(ctx).Submit(ctx, func() {
-		defer close(done)
-		for range rg.Out() {
-		}
-	})
+	done := drain(ctx, rg)
 
 	for n := 0; n < perKey; n++ {
 		for _, k := range keys {
@@ -975,17 +982,7 @@ func TestKeyedRepeatedStage(t *testing.T) {
 	<-done
 	p.Close()
 
-	for _, k := range keys {
-		got := sm.order[k]
-		if len(got) != perKey {
-			t.Fatalf("TestKeyedRepeatedStage(key %s): got %d first visits, want %d", k, len(got), perKey)
-		}
-		for i, n := range got {
-			if n != i {
-				t.Fatalf("TestKeyedRepeatedStage(%s): first visit %d == %d, want %d (out of order): %v", k, i, n, i, got)
-			}
-		}
-	}
+	wantKeyOrder(t, "TestKeyedRepeatedStage", keys, perKey, sm.order)
 }
 
 // benchSM has one ordered stage Work that simulates a fixed unit of work. Under a skewed key
@@ -1055,18 +1052,13 @@ func BenchmarkKeyedAdmissionDepth(b *testing.B) {
 				// depth 0 means unbounded, which WithAdmissionDepth(0) selects explicitly (New would
 				// otherwise apply the finite default).
 				opts := []Option{WithKey(ordKey), WithOrderedStages(sm.Work), WithAdmissionDepth(depth)}
-				p, err := New[ordData]("bench", 8, sm, opts...)
+				p, err := New[ordData](b.Context(), "bench", 8, sm, opts...)
 				if err != nil {
 					b.Fatalf("BenchmarkKeyedAdmissionDepth: New: %s", err)
 				}
 				ctx := b.Context()
 				rg := p.NewRequestGroup()
-				done := make(chan struct{})
-				context.Pool(ctx).Submit(ctx, func() {
-					defer close(done)
-					for range rg.Out() {
-					}
-				})
+				done := drain(ctx, rg)
 
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {

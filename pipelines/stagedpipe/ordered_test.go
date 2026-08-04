@@ -1,7 +1,6 @@
 package stagedpipe_test
 
 import (
-	"log"
 	"testing"
 
 	"github.com/gostdlib/base/context"
@@ -55,13 +54,13 @@ func TestOrdered(t *testing.T) {
 	// Create the StateMachine implementation that will be used in our pipeline.
 	xsm, err := NewOrderedSM()
 	if err != nil {
-		log.Fatalf("cannot start state machine: %s", err)
+		t.Fatalf("TestOrdered: cannot start state machine: %s", err)
 	}
 
 	// Create our parallel and concurrent Pipeline from our StateMachine.
-	pipeline, err := stagedpipe.New[OrderedData]("ordered test", 10, xsm, stagedpipe.WithOrdered())
+	pipeline, err := stagedpipe.New[OrderedData](t.Context(), "ordered test", 10, xsm, stagedpipe.WithOrdered())
 	if err != nil {
-		log.Fatalf("cannot create a pipeline: %s", err)
+		t.Fatalf("TestOrdered: cannot create a pipeline: %s", err)
 	}
 	defer pipeline.Close()
 
@@ -104,8 +103,7 @@ func TestOrdered(t *testing.T) {
 		}
 		req := NewOrderedRequest(reqCtx, OrderedData{Item: i})
 		if err := rg.Submit(req); err != nil {
-			log.Fatalf("problem submitting request to the pipeline: %s", err)
-			break
+			t.Fatalf("TestOrdered: problem submitting request to the pipeline: %s", err)
 		}
 	}
 	rg.Close()

@@ -75,14 +75,17 @@ Note: This package supports OTEL spans and will record information into OTEL spa
 package stagedpipe
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"reflect"
 	"runtime"
 	"runtime/debug"
 	"strings"
-	"sync"
+	// stdlibsync is imported only for WaitGroup. base/concurrency/sync deliberately omits it in favor
+	// of sync.Group, but Group cannot express the counting this package needs: the increment happens
+	// on the submitting goroutine and the matching decrement on a drain goroutine, which Group.Go/Wait
+	// has no way to split. Everything else here comes from base/concurrency/sync.
+	stdlibsync "sync"
 	"sync/atomic"
 	"time"
 
@@ -91,7 +94,10 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
+	"github.com/gostdlib/base/concurrency/sync"
+	"github.com/gostdlib/base/concurrency/worker"
 	"github.com/gostdlib/base/context"
+	"github.com/gostdlib/base/errors"
 	"github.com/gostdlib/base/telemetry/otel/trace/span"
 
 	"github.com/go-json-experiment/json"
@@ -153,41 +159,38 @@ func (e PanicError) Error() string {
 // RequestGroup.Close().
 var ErrTornDown = fmt.Errorf("stagedpipe: pipeline torn down after a stage panic: %w", ErrPermanent)
 
-// seenStagesPool is a pool of seenStages objects to reduce allocations.
-var seenStagesPool = sync.Pool{
-	New: func() any {
-		return &seenStages{}
-	},
-}
-
-// seenStages tracks what stages have been called in a Request. This is used to detect
-// cyclic errors. Implemented with a slice to reduce allocations and is faster to
-// remove elements from the slice than a map (to allow reuse). n is small, so the
-// lookup performance is negligible. This is not thread-safe (which is not needed).
-type seenStages []string
+// seenStages tracks what stages have been called in a Request. This is used to detect cyclic
+// errors. Stages are held as their entry PCs rather than their names: a stage's identity has always
+// been its PC (a name is only ever derived from one, see methodName), so comparing PCs is the same
+// test without the name lookup, and it keeps the name resolution off the per-stage path entirely --
+// callTrace resolves names once, when a cycle has actually been found. Implemented with a slice to
+// reduce allocations and is faster to remove elements from than a map (to allow reuse). n is small,
+// so the lookup performance is negligible. This is not thread-safe (which is not needed).
+type seenStages []uintptr
 
 // seen returns true if the stage has been seen before. If it has not been seen,
 // it adds it to the list of seen stages.
-func (s *seenStages) seen(stage string) bool {
+func (s *seenStages) seen(pc uintptr) bool {
 	for _, st := range *s {
-		if st == stage {
+		if st == pc {
 			return true
 		}
 	}
 
-	n := append(*s, stage)
+	n := append(*s, pc)
 	*s = n
 	return false
 }
 
-// callTrace returns a string of the stages that have been called.
+// callTrace returns a string of the stages that have been called. It is only reached when a cycle
+// has been detected, so resolving each PC to its name here costs nothing on the success path.
 func (s *seenStages) callTrace() string {
 	out := strings.Builder{}
-	for i, st := range *s {
+	for i, pc := range *s {
 		if i != 0 {
 			out.WriteString(" -> ")
 		}
-		out.WriteString(st)
+		out.WriteString(funcName(pc))
 	}
 	return out.String()
 }
@@ -327,8 +330,23 @@ type Pipelines[T any] struct {
 	// takes longer than the supplied time.Duration.
 	delayWarning time.Duration
 
-	// wg is used to know when it is safe to close the output channel.
-	wg *sync.WaitGroup
+	// wg counts Request(s) that have entered the Pipelines and not yet been handed to a caller. It is
+	// used to know when it is safe to close the output channel.
+	wg *stdlibsync.WaitGroup
+
+	// pool is where this Pipelines' coordinator jobs run: the autoscale governor, the Close reaper and
+	// each RequestGroup's output drain loop. It is a Sub of the caller's pool (or of the default pool
+	// when the caller's is Limited), named for this Pipelines so its jobs report their own metrics. The
+	// stage workers do NOT run here; see Pipelines.workers.
+	pool *worker.Pool
+	// bg is the Context the coordinators are submitted and waited on. It is New's Context stripped of
+	// cancellation, so a cancelled caller Context never causes Submit to decline a coordinator (which
+	// would leave the output channel unclosed) while the coordinators still see its values: the
+	// MeterProvider, tracer and pool the caller configured.
+	bg context.Context
+	// workers is the join point for the stage worker goroutines. It is a Group with no Pool on purpose;
+	// see newPipeline's runner spawn for why.
+	workers *sync.Group
 
 	// requestGroupNum is used to generate the next number for a RequestGroup used to
 	// route requests to the correct RequestGroup.
@@ -337,6 +355,9 @@ type Pipelines[T any] struct {
 	demux *demux.Demux[uint64, Request[T]]
 
 	stats *stats
+	// seenPool recycles the seenStages trackers used for cyclic detection. It is built only when
+	// WithDAG() is set and is nil otherwise, so a pipeline that does not need it pays no meter.
+	seenPool *sync.Pool[*seenStages]
 	// ss is true if the WithDAG() option was set.
 	ss bool
 	// ordered is true if the WithOrdered() option was set.
@@ -478,8 +499,13 @@ func resetNext[T any](req Request[T]) Request[T] {
 
 // New creates a new Pipelines object with "num" pipelines running in parallel.
 // Each underlying pipeline runs concurrently for each stage. The first StateMachine.Start()
-// in the list is the starting place for executions
-func New[T any](name string, num int, sm StateMachine[T], options ...Option) (*Pipelines[T], error) {
+// in the list is the starting place for executions.
+//
+// ctx is the Pipelines' lifetime Context, not a per-Request one: it supplies the worker pool the
+// coordinators run on and the MeterProvider and tracer their metrics and spans are reported through.
+// Cancelling it does not stop the Pipelines — call Close() for that, and cancel an individual
+// Request through its own Request.Ctx.
+func New[T any](ctx context.Context, name string, num int, sm StateMachine[T], options ...Option) (*Pipelines[T], error) {
 	if num < 1 {
 		return nil, fmt.Errorf("num must be > 0")
 	}
@@ -564,13 +590,38 @@ func New[T any](name string, num int, sm StateMachine[T], options ...Option) (*P
 		return nil, err
 	}
 
+	// Coordinators run on the caller's pool so their work is accounted where the caller expects, unless
+	// that pool is Limited: a coordinator lives as long as the Pipelines (or the RequestGroup it
+	// drains), so a limited slot it took would be held for that whole time instead of doing work, and
+	// against a saturated Limited pool the submit would wait for a slot that never frees. Pool.Limit()
+	// reports 0 for an unlimited pool, which is the check. Sub() is called directly here, not through a
+	// helper, because its meter name is derived from the caller's stack frame.
+	base := context.Pool(ctx)
+	if base.Limit() != 0 {
+		base = base.Default()
+	}
+	pool := base.Sub(ctx, name)
+
+	// A Context that cannot be cancelled, so a cancelled caller Context never makes Submit decline a
+	// coordinator and strand the output channel unclosed. Values (MeterProvider, tracer, pool) survive.
+	bg := context.WithoutCancel(ctx)
+
+	var seenPool *sync.Pool[*seenStages]
+	if opts.ss {
+		seenPool = sync.NewPool[*seenStages](ctx, "seenStages", func() *seenStages { return &seenStages{} })
+	}
+
 	p := &Pipelines[T]{
 		name:          name,
 		in:            in,
 		out:           out,
-		wg:            &sync.WaitGroup{},
+		wg:            &stdlibsync.WaitGroup{},
+		pool:          pool,
+		bg:            bg,
+		workers:       &sync.Group{},
 		sm:            sm,
 		stats:         stats,
+		seenPool:      seenPool,
 		demux:         d,
 		preProcessors: preProcessors,
 		subStages:     subStages,
@@ -592,11 +643,14 @@ func New[T any](name string, num int, sm StateMachine[T], options ...Option) (*P
 			subStages:     p.subStages,
 			preProcessors: p.preProcessors,
 			stats:         stats,
+			seenPool:      seenPool,
 			delayWarning:  p.delayWarning,
 			ss:            p.ss,
 			autoscale:     opts.autoScale != nil,
 			keyOrder:      keyOrd,
 			panicked:      &p.panicked,
+			workers:       p.workers,
+			bg:            bg,
 		}
 
 		pl, err := newPipeline(args)
@@ -618,9 +672,10 @@ func New[T any](name string, num int, sm StateMachine[T], options ...Option) (*P
 		initial := clamp(num, opts.autoScale.min, opts.autoScale.max) * width
 		s := &scaler[T]{
 			stats:  stats,
-			spawn1: pipelines[0].runner,
+			spawn1: pipelines[0].start,
 			quit:   make(chan struct{}),
 			stop:   make(chan struct{}),
+			done:   make(chan struct{}),
 			size:   initial,
 			ctrl: &ctrl{
 				width: width,
@@ -631,7 +686,9 @@ func New[T any](name string, num int, sm StateMachine[T], options ...Option) (*P
 		}
 		s.spawn(initial)
 		p.scaler = s
-		go s.loop()
+		// The governor is a coordinator: it lives for the whole Pipelines and only ticks, so it runs on
+		// the pool rather than holding a worker of its own.
+		_ = pool.Submit(bg, s.loop)
 	}
 
 	return p, nil
@@ -647,11 +704,21 @@ func (p *Pipelines[T]) Close() {
 	}
 	close(p.in)
 
-	go func() {
+	_ = p.pool.Submit(p.bg, func() {
+		// Every Request has been handed to a RequestGroup drain loop, so no worker still holds one.
 		p.wg.Wait()
+		// Join the governor before the workers: closing stop only tells it to exit, and a tick already
+		// in flight may still be spawning. Once it has returned, the worker set is final.
+		if p.scaler != nil {
+			<-p.scaler.done
+		}
+		// p.in is closed and nothing more can be spawned, so every live worker is either exiting or
+		// parked on the closed channel. Joining them here means Close's teardown covers the workers
+		// themselves and not merely the Requests they carried.
+		_ = p.workers.Wait(p.bg)
 		close(p.out)
 		p.sm.Close()
-	}()
+	})
 }
 
 // RequestGroup provides in and out channels to send a group of related data into
@@ -675,8 +742,9 @@ type RequestGroup[T any] struct {
 	user chan Request[T]
 	// p is the Pipelines object this RequestGroup is tied to.
 	p *Pipelines[T]
-	// wg is used to know when it is safe to close the output channel.
-	wg sync.WaitGroup
+	// wg counts this group's in-flight Request(s). It is used to know when it is safe to close the
+	// output channel.
+	wg stdlibsync.WaitGroup
 	// id is the ID of the RequestGroup.
 	id uint64
 
@@ -799,7 +867,7 @@ func (r *RequestGroup[T]) otelEnd() {
 // in this set of Pipelines.
 func (p *Pipelines[T]) NewRequestGroup() *RequestGroup[T] {
 	id := p.requestGroupNum.Add(1)
-	r := RequestGroup[T]{
+	r := &RequestGroup[T]{
 		id:        id,
 		out:       make(chan Request[T], 1),
 		user:      make(chan Request[T], 1),
@@ -808,15 +876,18 @@ func (p *Pipelines[T]) NewRequestGroup() *RequestGroup[T] {
 	}
 	p.demux.AddReceiver(id, r.out)
 
-	// If ordered is set, we need to return the output in order.
-	if p.ordered {
+	// The drain loop is a coordinator, so it runs on the Pipelines' pool rather than a goroutine of its
+	// own. It is submitted on the Pipelines' uncancellable Context: a declined submit would leave the
+	// user channel unclosed and every reader of Out() hung, and the loop needs no cancellation of its
+	// own since it ends when the demuxer closes r.out.
+	if p.ordered { // Output must be returned in the order it was submitted.
 		r.ordered = demux.NewInOrder(
 			func(r Request[T]) uint64 {
 				return r.itemNum
 			},
 			r.user,
 		)
-		go func() {
+		_ = p.pool.Submit(p.bg, func() {
 			defer r.ordered.Close()
 			for req := range r.out {
 				r.wg.Done()
@@ -826,20 +897,22 @@ func (p *Pipelines[T]) NewRequestGroup() *RequestGroup[T] {
 					panic(fmt.Sprintf("bug: ordered demuxer: %s", err))
 				}
 			}
-		}()
-	} else { // No output order is required.
-		go func() {
-			defer close(r.user)
-			for req := range r.out {
-				r.wg.Done()
-				r.p.wg.Done()
-				req.otelEnd()
-				r.user <- req
-			}
-		}()
+		})
+		return r
 	}
 
-	return &r
+	// No output order is required.
+	_ = p.pool.Submit(p.bg, func() {
+		defer close(r.user)
+		for req := range r.out {
+			r.wg.Done()
+			r.p.wg.Done()
+			req.otelEnd()
+			r.user <- req
+		}
+	})
+
+	return r
 }
 
 // Stats returns stats about all the running Pipelines.
@@ -864,6 +937,12 @@ type pipeline[T any] struct {
 	keyOrder *keyOrder[T]
 	// panicked points at the parent Pipelines' first-panic slot, shared by every worker.
 	panicked *atomic.Pointer[PanicError]
+	// seenPool is the parent Pipelines' seenStages pool, non-nil only when WithDAG() is set.
+	seenPool *sync.Pool[*seenStages]
+	// workers is the parent Pipelines' worker join point, shared by every pipeline and the scaler.
+	workers *sync.Group
+	// bg is the parent Pipelines' uncancellable lifetime Context, used to start workers.
+	bg context.Context
 }
 
 type pipelineArgs[T any] struct {
@@ -885,6 +964,12 @@ type pipelineArgs[T any] struct {
 	keyOrder *keyOrder[T]
 	// panicked points at the parent Pipelines' first-panic slot.
 	panicked *atomic.Pointer[PanicError]
+	// seenPool is the shared seenStages pool, non-nil only when WithDAG() is set.
+	seenPool *sync.Pool[*seenStages]
+	// workers is the shared worker join point.
+	workers *sync.Group
+	// bg is the parent Pipelines' uncancellable lifetime Context.
+	bg context.Context
 }
 
 // newPipeline creates a new Pipeline. A new Pipeline should be created for a new set of related
@@ -902,6 +987,9 @@ func newPipeline[T any](args pipelineArgs[T]) (*pipeline[T], error) {
 		delayWarning:  args.delayWarning,
 		keyOrder:      args.keyOrder,
 		panicked:      args.panicked,
+		seenPool:      args.seenPool,
+		workers:       args.workers,
+		bg:            args.bg,
 	}
 
 	p.concurrency = numStages[T](args.sm) + args.subStages
@@ -917,10 +1005,27 @@ func newPipeline[T any](args pipelineArgs[T]) (*pipeline[T], error) {
 	}
 
 	for i := 0; i < p.concurrency; i++ {
-		go p.runner(nil, nil)
+		p.start(nil, nil)
 	}
 
 	return p, nil
+}
+
+// start launches one stage worker on the shared Group and returns at once. The Group deliberately has
+// no Pool: a worker is a permanently blocked receiver on p.in, not a task, so it would hold a pool
+// runner for the life of the Pipelines and never return it — the pool's only benefit, reuse, is
+// unreachable. Worse, a worker parks at an ordered-stage barrier while it waits its key's turn
+// (execStage), so on a Limited pool enough parked workers deadlock the pool against itself, and on the
+// shared default pool they would consume every static runner and degrade every other Submit in the
+// process. Running them on the Group's own goroutines costs exactly one goroutine per worker and takes
+// no slot from anyone, while still giving Close a join point. Submitted on the uncancellable lifetime
+// Context so a cancelled caller Context cannot skip a worker; a worker exits on p.in closing or on a
+// quit token from the autoscaler.
+func (p *pipeline[T]) start(quit <-chan struct{}, live *atomic.Int64) {
+	p.workers.Go(p.bg, func(context.Context) error {
+		p.runner(quit, live)
+		return nil
+	})
 }
 
 // runner processes requests until either p.in is closed (Close) or a quit token is received (the
@@ -976,9 +1081,9 @@ func (p *pipeline[T]) processReq(r Request[T]) (out Request[T]) {
 	r.ingestTime = time.Now()
 	queuedTime := time.Since(r.queueTime)
 	if p.ss {
-		r.seenStages = seenStagesPool.Get().(*seenStages).reset()
+		r.seenStages = p.seenPool.Get(r.Ctx).reset()
 		defer func() {
-			seenStagesPool.Put(out.seenStages)
+			p.seenPool.Put(out.Ctx, out.seenStages)
 			out.seenStages = nil
 		}()
 	}
@@ -1021,11 +1126,11 @@ func (p *pipeline[T]) processReq(r Request[T]) (out Request[T]) {
 func (p *pipeline[T]) execStage(r Request[T], stage Stage[T]) (out Request[T]) {
 	recording := r.span.IsRecording()
 
-	// stageName is only needed for OTEL span/event naming (when recording) or for cyclic
-	// detection (when the WithDAG option is set). On the common !recording, non-DAG path it is
-	// never computed, keeping methodName's reflection off the hot path.
+	// stageName is only needed for OTEL span/event naming, so it is computed only when recording.
+	// Cyclic detection does not need it: it compares entry PCs and resolves names only if it finds a
+	// cycle, which keeps methodName's reflection and cache lookup off the hot path.
 	var stageName string
-	if recording || r.seenStages != nil {
+	if recording {
 		stageName = methodName(stage)
 	}
 
@@ -1068,7 +1173,7 @@ func (p *pipeline[T]) execStage(r Request[T], stage Stage[T]) (out Request[T]) {
 	}
 
 	if r.seenStages != nil {
-		if r.seenStages.seen(stageName) {
+		if r.seenStages.seen(reflect.ValueOf(stage).Pointer()) {
 			r.Err = Error{Type: cyclicErr, Msg: r.seenStages.callTrace()}
 			return r
 		}
@@ -1187,11 +1292,20 @@ func methodName(method any) string {
 	if valueOf.Kind() != reflect.Func {
 		return "<not a function>"
 	}
-	pc := valueOf.Pointer()
+	return funcName(valueOf.Pointer())
+}
+
+// funcName resolves a function's entry PC to its name, through methodNameCache. A PC the runtime
+// cannot resolve yields a placeholder rather than a panic, since the caller may be building the
+// message for an error that is already in flight.
+func funcName(pc uintptr) string {
 	if v, ok := methodNameCache.Load(pc); ok {
 		return v.(string)
 	}
-	name := strings.TrimSuffix(strings.TrimSuffix(runtime.FuncForPC(pc).Name(), "-fm"), "[...]")
+	name := "<unknown>"
+	if f := runtime.FuncForPC(pc); f != nil {
+		name = strings.TrimSuffix(strings.TrimSuffix(f.Name(), "-fm"), "[...]")
+	}
 	methodNameCache.Store(pc, name)
 	return name
 }

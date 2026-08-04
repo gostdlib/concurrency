@@ -31,18 +31,16 @@ func tracedCtx(t *testing.T) (context.Context, *tracetest.SpanRecorder, func()) 
 func runOne(t *testing.T, ctx context.Context, name string) {
 	t.Helper()
 
-	p, err := New[int](name, 1, &statsSM{})
+	// New gets the traced ctx, not a bare one: the Pipelines resolves its coordinator pool and its
+	// MeterProvider/tracer from this Context, so passing the traced one is what a caller does and is
+	// what keeps this test exercising the real wiring.
+	p, err := New[int](ctx, name, 1, &statsSM{})
 	if err != nil {
 		t.Fatalf("%s: cannot create pipeline: %s", name, err)
 	}
 
 	rg := p.NewRequestGroup()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for range rg.Out() {
-		}
-	}()
+	done := drain(ctx, rg)
 	if err := rg.Submit(Request[int]{Ctx: ctx, Data: 1}); err != nil {
 		t.Fatalf("%s: problem submitting request: %s", name, err)
 	}

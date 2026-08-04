@@ -20,6 +20,20 @@ func eventually(t *testing.T, cond func() bool) bool {
 	return cond()
 }
 
+// parkedWorkers returns a spawn1 for s. Like pipeline.start it launches a worker and returns at
+// once; the worker then parks until it is handed a quit token or the governor stops.
+func parkedWorkers[T any](s *scaler[T]) func(quit <-chan struct{}, live *atomic.Int64) {
+	return func(quit <-chan struct{}, live *atomic.Int64) {
+		go func() {
+			defer live.Add(-1)
+			select {
+			case <-quit:
+			case <-s.stop:
+			}
+		}()
+	}
+}
+
 func smpl(tsec int, completed, running int64, workers int) sample {
 	return sample{
 		t:         time.Unix(int64(1000+tsec), 0),
@@ -157,7 +171,7 @@ func TestAutoScaleValidate(t *testing.T) {
 	}{
 		{name: "Success: valid bounds", cfg: autoScaleCfg{min: 2, max: 64}},
 		{name: "Error: min below 1", cfg: autoScaleCfg{min: 0, max: 64}, wantErr: true},
-		{name: "Error: max below min", cfg: autoScaleCfg{min: 8, max: 4}, wantErr: true},
+		{name: "Error: max below min", cfg: autoScaleCfg{min: 2, max: 1}, wantErr: true},
 	}
 
 	for _, test := range tests {
@@ -175,14 +189,11 @@ func TestAutoScaleValidate(t *testing.T) {
 func TestScalerSpawnRemove(t *testing.T) {
 	t.Parallel()
 
-	s := &scaler[int]{quit: make(chan struct{}), stop: make(chan struct{})}
-	s.spawn1 = func(quit <-chan struct{}, live *atomic.Int64) {
-		defer live.Add(-1)
-		select {
-		case <-quit:
-		case <-s.stop:
-		}
-	}
+	// sendGrace is set high because this test asserts on the live worker count: a worker here is always
+	// parked and ready to take a quit token, so a delivery that "times out" would only mean the
+	// scheduler was slow, which must not be mistaken for the mechanism failing.
+	s := &scaler[int]{quit: make(chan struct{}), stop: make(chan struct{}), sendGrace: 30 * time.Second}
+	s.spawn1 = parkedWorkers(s)
 
 	if got := s.spawn(5); got != 5 {
 		t.Fatalf("TestScalerSpawnRemove: spawn returned %d, want 5", got)
@@ -198,8 +209,14 @@ func TestScalerSpawnRemove(t *testing.T) {
 		t.Fatalf("TestScalerSpawnRemove: after remove(3) live = %d, want 2", s.live.Load())
 	}
 
-	// With the governor stopped, remove gives up immediately rather than blocking.
+	// With the governor stopped, remove gives up rather than blocking. The surviving workers are
+	// drained first: while one is still parked on quit, remove's send and its stop case are both ready
+	// and the select may pick either, so a delivery there would say nothing about whether stop was
+	// observed. Once nothing can receive a token, a non-zero return can only mean stop was ignored.
 	close(s.stop)
+	if !eventually(t, func() bool { return s.live.Load() == 0 }) {
+		t.Fatalf("TestScalerSpawnRemove: after close(stop) live = %d, want 0", s.live.Load())
+	}
 	if got := s.remove(10); got != 0 {
 		t.Errorf("TestScalerSpawnRemove: remove after stop returned %d, want 0", got)
 	}
@@ -237,25 +254,30 @@ func TestGovernorLoop(t *testing.T) {
 	st := newStats()
 	// width=3 (3 workers per pipeline), 1..8 pipelines => 3..24 workers; start at 2 pipelines.
 	const width, minW = 3, 3
+	// applied makes each tick observable as complete rather than merely delivered, and sendGrace is
+	// set high because the fake workers are always parked: a delivery that lost the race with the
+	// default 50ms timer would leave the pool larger than the governor intended, for no reason other
+	// than scheduler latency.
 	s := &scaler[int]{
 		stats: st,
-		quit:  make(chan struct{}), stop: make(chan struct{}),
+		quit:  make(chan struct{}), stop: make(chan struct{}), done: make(chan struct{}),
+		applied: make(chan struct{}), sendGrace: 30 * time.Second,
 		size: 2 * width, ctrl: &ctrl{width: width, minW: minW, maxW: 8 * width}, clk: fc,
 	}
-	s.spawn1 = func(quit <-chan struct{}, live *atomic.Int64) {
-		defer live.Add(-1)
-		select {
-		case <-quit:
-		case <-s.stop:
-		}
-	}
+	s.spawn1 = parkedWorkers(s)
 	s.spawn(2 * width)
 	go s.loop()
 	defer close(s.stop)
 
+	// fire delivers one tick and waits for the governor to finish applying it. Waiting is what makes
+	// this test deterministic: the send alone only proves the governor received the tick, so without
+	// the handshake the test could race ahead and mutate the clock and stats that the tick it just
+	// sent is still about to read. The receive also orders the governor's writes to s.size before the
+	// reads below.
 	fire := func() {
 		fc.advance(asInterval)
 		fc.c <- fc.cur
+		<-s.applied
 	}
 
 	// Saturated + accelerating completions => throughput keeps improving => climb by whole pipelines.
@@ -267,17 +289,61 @@ func TestGovernorLoop(t *testing.T) {
 		st.running.Store(1000) // always >= size => saturated
 		fire()
 	}
-	if !eventually(t, func() bool { return s.live.Load() > int64(2*width) }) {
-		t.Fatalf("TestGovernorLoop: under saturation+improvement live did not grow above %d, got %d", 2*width, s.live.Load())
+	if s.size <= 2*width {
+		t.Fatalf("TestGovernorLoop: under saturation+improvement size did not grow above %d, got %d", 2*width, s.size)
 	}
 
-	// Idle => shrink to min pipelines.
+	// Idle => shrink to min pipelines. Ticks are driven until the governor converges rather than a
+	// fixed number of them: the controller's hysteresis (asHoldN) legitimately absorbs several ticks
+	// before the shrink, and how many depends on the state the climb left behind. The cap keeps a
+	// controller that never converges a bounded failure instead of a hang.
 	st.running.Store(0)
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 20 && s.size != minW; i++ {
 		fire()
 	}
+	if s.size != minW {
+		t.Fatalf("TestGovernorLoop: when idle size did not shrink to min %d, got %d", minW, s.size)
+	}
+	// The workers themselves exit on their own goroutines after taking the quit token, so live is the
+	// one thing here that is legitimately asynchronous and still worth waiting on.
 	if !eventually(t, func() bool { return s.live.Load() == int64(minW) }) {
 		t.Fatalf("TestGovernorLoop: when idle live did not shrink to min %d, got %d", minW, s.live.Load())
+	}
+}
+
+// TestGovernorStopWithPendingHandshake is a regression test for the tick-completion handshake: the
+// governor must still exit when stop is closed while a handshake send is outstanding. A receiver
+// that has stopped receiving — a test that finished with the scaler, or one that failed early and
+// returned — must not be able to wedge the governor on that send, because Close waits on the
+// governor before it joins the workers, so a wedged loop hangs teardown rather than just leaking.
+func TestGovernorStopWithPendingHandshake(t *testing.T) {
+	t.Parallel()
+
+	fc := &fakeClock{cur: time.Unix(1000, 0), c: make(chan time.Time)}
+	s := &scaler[int]{
+		stats: newStats(),
+		quit:  make(chan struct{}), stop: make(chan struct{}), done: make(chan struct{}),
+		applied: make(chan struct{}),
+		size:    3, ctrl: &ctrl{width: 3, minW: 3, maxW: 24}, clk: fc,
+	}
+	s.spawn1 = parkedWorkers(s)
+	go s.loop()
+
+	// One complete tick, handshake included, to establish that the governor is running normally.
+	fc.advance(asInterval)
+	fc.c <- fc.cur
+	<-s.applied
+
+	// A second tick that nobody acknowledges. The governor applies it and then has a handshake send
+	// with no receiver.
+	fc.advance(asInterval)
+	fc.c <- fc.cur
+
+	close(s.stop)
+	select {
+	case <-s.done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("TestGovernorStopWithPendingHandshake: governor did not exit after stop with a handshake outstanding")
 	}
 }
 
@@ -286,7 +352,7 @@ func TestGovernorLoop(t *testing.T) {
 func TestAutoScalePipeline(t *testing.T) {
 	t.Parallel()
 
-	p, err := New[int]("autoscale", 2, &statsSM{}, WithAutoScale(2, 16))
+	p, err := New[int](t.Context(), "autoscale", 2, &statsSM{}, WithAutoScale(2, 16))
 	if err != nil {
 		t.Fatalf("TestAutoScalePipeline: cannot create pipeline: %s", err)
 	}
