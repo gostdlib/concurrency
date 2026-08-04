@@ -24,8 +24,10 @@ func main() {
 	}()
 
 	sm := NewSM()
+	ctx := context.Background()
 
 	p, err := stagedpipe.New(
+		ctx,
 		"etoe",
 		1,
 		stagedpipe.StateMachine[Data](sm),
@@ -83,7 +85,6 @@ func main() {
 
 	// const _100Million = 100000000
 	const _1K = 1000 // Which does 1000 * 1000(each Request has 1000 entries)
-	ctx := context.Background()
 
 	for i := 0; i < _1K; i++ {
 		select {

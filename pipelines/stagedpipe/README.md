@@ -180,6 +180,7 @@ If you don't know the right number ahead of time — or the ideal number changes
 
 ```go
 p, err := stagedpipe.New(
+    ctx,                              // the Pipelines' lifetime Context
     "my-pipeline",
     runtime.NumCPU(),                 // starting (base) number of pipelines
     sm,

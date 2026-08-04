@@ -15,6 +15,19 @@ import (
 	"github.com/gostdlib/concurrency/pipelines/stagedpipe/testing/client"
 )
 
+// drain consumes rg's output until it closes, returning a channel that closes once it has. Every
+// Request has to be pulled from Out() or the Pipelines stall, so even a test that never inspects the
+// output must drain it. It runs on the pool rather than a raw goroutine, as the library does.
+func drain[T any](ctx context.Context, rg *RequestGroup[T]) chan struct{} {
+	done := make(chan struct{})
+	context.Pool(ctx).Submit(ctx, func() {
+		defer close(done)
+		for range rg.Out() {
+		}
+	})
+	return done
+}
+
 // SM implements StateMachine.
 type SM struct {
 	// idClient is a client for querying for information based on an ID.
@@ -128,31 +141,31 @@ func TestPipelines(t *testing.T) {
 	rsErr := g.genRequests(1000)
 
 	tests := []struct {
-		desc     string
+		name     string
 		requests []Request[[]client.Record]
-		err      bool
+		wantErr  bool
 	}{
 		{
-			desc:     "1 entry only",
+			name:     "Success: 1 entry only",
 			requests: rs1,
 		},
 
 		{
-			desc:     "1000 entries",
+			name:     "Success: 1000 entries",
 			requests: rs1000,
 		},
 
 		{
-			desc:     "1000 entries with an error at 500",
+			name:     "Error: 1000 entries with an error at 500",
 			requests: rsErr,
-			err:      true,
+			wantErr:  true,
 		},
 	}
 
 	sm := NewSM(&client.ID{})
-	p, err := New("test statemachine", 10, StateMachine[[]client.Record](sm))
+	p, err := New(t.Context(), "test statemachine", 10, StateMachine[[]client.Record](sm))
 	if err != nil {
-		panic(err)
+		t.Fatalf("TestPipelines: cannot create pipeline: %s", err)
 	}
 	defer p.Close()
 
@@ -188,15 +201,15 @@ func TestPipelines(t *testing.T) {
 				}
 
 				for _, rec := range out.Data {
-					if !test.err {
+					if !test.wantErr {
 						id, _ := strconv.Atoi(rec.ID)
 						expectedRecs[id-1] = true
 						if rec.Birth.IsZero() {
-							log.Fatalf("TestPipeline(%s): requests are not being processed", test.desc)
+							log.Fatalf("TestPipeline(%s): requests are not being processed", test.name)
 						}
 						wantBirth := time.Time{}.Add(time.Duration(id) * day)
 						if !rec.Birth.Equal(wantBirth) {
-							log.Fatalf("TestPipeline(%s): requests are not being processed correctly, ID %d gave Birthday of %v, want %v", test.desc, id, rec.Birth, wantBirth)
+							log.Fatalf("TestPipeline(%s): requests are not being processed correctly, ID %d gave Birthday of %v, want %v", test.name, id, rec.Birth, wantBirth)
 						}
 					}
 				}
@@ -213,7 +226,7 @@ func TestPipelines(t *testing.T) {
 			}
 			req.Ctx = reqCtx
 			if err := rg.Submit(req); err != nil {
-				t.Logf("Test(%s): problem submitting request to pipeline: %s", test.desc, err)
+				t.Logf("Test(%s): problem submitting request to pipeline: %s", test.name, err)
 			}
 		}
 		// Tell the pipeline that this request group is done.
@@ -223,19 +236,19 @@ func TestPipelines(t *testing.T) {
 		processingErr := <-done
 
 		switch {
-		case processingErr == nil && test.err:
-			t.Errorf("Test(%s): got err == nil, want err != nil", test.desc)
+		case processingErr == nil && test.wantErr:
+			t.Errorf("Test(%s): got err == nil, want err != nil", test.name)
 			continue
-		case processingErr != nil && !test.err:
-			t.Errorf("Test(%s): got err == %s, want err == nil", test.desc, processingErr)
+		case processingErr != nil && !test.wantErr:
+			t.Errorf("Test(%s): got err == %s, want err == nil", test.name, processingErr)
 			continue
-		case test.err:
+		case test.wantErr:
 			continue
 		}
 
 		for i := 0; i < len(expectedRecs); i++ {
 			if !expectedRecs[i] {
-				t.Errorf("TestPipelines(%s): an expected client.Record[%d] was not set", test.desc, i)
+				t.Errorf("TestPipelines(%s): an expected client.Record[%d] was not set", test.name, i)
 			}
 		}
 	}
@@ -248,7 +261,7 @@ func BenchmarkPipeline(b *testing.B) {
 	reqs := gen.genRequests(100000)
 	sm := NewSM(&client.ID{})
 
-	p, err := New("test", runtime.NumCPU(), StateMachine[[]client.Record](sm))
+	p, err := New(b.Context(), "test", runtime.NumCPU(), StateMachine[[]client.Record](sm))
 	if err != nil {
 		panic(err)
 	}
@@ -256,12 +269,9 @@ func BenchmarkPipeline(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		g := p.NewRequestGroup()
-		go func() {
-			// For this exercise we need to drain the Out channel so things continue
-			// to process.
-			for range g.Out() {
-			}
-		}()
+		// The Out channel has to be drained for processing to continue, even though this benchmark
+		// does nothing with the output.
+		drain(b.Context(), g)
 
 		for _, req := range reqs {
 			req.Ctx = context.Background()
@@ -305,6 +315,7 @@ func TestDAG(t *testing.T) {
 
 	sm := &DAGSM{}
 	p, err := New[DAGData](
+		t.Context(),
 		"test statemachine",
 		10,
 		sm,
@@ -312,7 +323,7 @@ func TestDAG(t *testing.T) {
 	)
 
 	if err != nil {
-		panic(err)
+		t.Fatalf("TestDAG: cannot create pipeline: %s", err)
 	}
 	defer p.Close()
 
@@ -374,10 +385,16 @@ func TestDAG(t *testing.T) {
 			t.Errorf("got %d, want %d", got[i].Data.Num, i)
 		}
 
+		// Even Num routes back to Start and so revisits a stage, which WithDAG rejects; odd Num runs
+		// Start -> End and must come out clean.
 		if i%2 == 0 {
 			if !IsErrCyclic(got[i].Err) {
-				t.Errorf("request %d, got %q, want a cyclic error", i, got[i].Err)
+				t.Errorf("TestDAG: request %d, got %q, want a cyclic error", i, got[i].Err)
 			}
+			continue
+		}
+		if got[i].Err != nil {
+			t.Errorf("TestDAG: request %d, got err == %s, want err == nil", i, got[i].Err)
 		}
 	}
 }
@@ -410,19 +427,14 @@ func TestClose(t *testing.T) {
 	t.Parallel()
 
 	sm := newCloseSM()
-	p, err := New[int]("close regression", 2, sm)
+	p, err := New[int](t.Context(), "close regression", 2, sm)
 	if err != nil {
 		t.Fatalf("TestClose: cannot create pipeline: %s", err)
 	}
 
 	rg := p.NewRequestGroup()
 
-	drained := make(chan struct{})
-	go func() {
-		defer close(drained)
-		for range rg.Out() {
-		}
-	}()
+	drained := drain(t.Context(), rg)
 
 	for i := 0; i < 10; i++ {
 		req := Request[int]{Ctx: t.Context(), Data: i}
@@ -463,19 +475,14 @@ func (s *statsSM) Close() {}
 func TestStats(t *testing.T) {
 	t.Parallel()
 
-	p, err := New[int]("stats regression", 2, &statsSM{})
+	p, err := New[int](t.Context(), "stats regression", 2, &statsSM{})
 	if err != nil {
 		t.Fatalf("TestStats: cannot create pipeline: %s", err)
 	}
 	defer p.Close()
 
 	rg := p.NewRequestGroup()
-	drained := make(chan struct{})
-	go func() {
-		defer close(drained)
-		for range rg.Out() {
-		}
-	}()
+	drained := drain(t.Context(), rg)
 
 	for i := 0; i < 20; i++ {
 		if err := rg.Submit(Request[int]{Ctx: t.Context(), Data: i}); err != nil {
@@ -504,7 +511,7 @@ func TestNewCapturesPipelines(t *testing.T) {
 
 	const num = 4
 
-	p, err := New[int]("pipelines regression", num, &statsSM{})
+	p, err := New[int](t.Context(), "pipelines regression", num, &statsSM{})
 	if err != nil {
 		t.Fatalf("TestNewCapturesPipelines: cannot create pipeline: %s", err)
 	}
@@ -530,11 +537,11 @@ func TestIsErrCyclic(t *testing.T) {
 		err  error
 		want bool
 	}{
-		{name: "a nil error is not cyclic", err: nil, want: false},
-		{name: "a plain cyclic Error is cyclic", err: Error{Type: cyclicErr}, want: true},
-		{name: "a wrapped cyclic Error is cyclic", err: fmt.Errorf("stage failed: %w", Error{Type: cyclicErr}), want: true},
-		{name: "a non-cyclic Error type is not cyclic", err: Error{Type: "other"}, want: false},
-		{name: "a plain error is not cyclic", err: errors.New("boom"), want: false},
+		{name: "Success: a nil error is not cyclic", err: nil, want: false},
+		{name: "Success: a plain cyclic Error is cyclic", err: Error{Type: cyclicErr}, want: true},
+		{name: "Success: a wrapped cyclic Error is cyclic", err: fmt.Errorf("stage failed: %w", Error{Type: cyclicErr}), want: true},
+		{name: "Success: a non-cyclic Error type is not cyclic", err: Error{Type: "other"}, want: false},
+		{name: "Success: a plain error is not cyclic", err: errors.New("boom"), want: false},
 	}
 
 	for _, test := range tests {
@@ -566,7 +573,7 @@ func TestWithPreProcessors(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		p, err := New[int]("preproc test", 1, &statsSM{}, WithPreProcessors(test.pp))
+		p, err := New[int](t.Context(), "preproc test", 1, &statsSM{}, WithPreProcessors(test.pp))
 		switch {
 		case err == nil && test.wantErr:
 			t.Errorf("TestWithPreProcessors(%s): got err == nil, want err != nil", test.name)
@@ -610,5 +617,82 @@ func TestMethodName(t *testing.T) {
 	mn := methodName(sm.Start)
 	if !strings.HasSuffix(mn, ".Start") {
 		t.Fatalf("TestMethodName: got %s, it to end with '.Start'", mn)
+	}
+}
+
+// TestNew covers New's argument guards. Each error case breaks exactly one argument against the
+// success baseline, so a failure names the argument that was rejected.
+func TestNew(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		num     int
+		sm      StateMachine[int]
+		wantErr bool
+	}{
+		{name: "Success: a positive num and a real StateMachine", num: 1, sm: &statsSM{}},
+		{name: "Error: num is zero", num: 0, sm: &statsSM{}, wantErr: true},
+		{name: "Error: num is negative", num: -1, sm: &statsSM{}, wantErr: true},
+		{name: "Error: a nil StateMachine", num: 1, sm: nil, wantErr: true},
+	}
+
+	for _, test := range tests {
+		p, err := New[int](t.Context(), "new guards", test.num, test.sm)
+		switch {
+		case err == nil && test.wantErr:
+			t.Errorf("TestNew(%s): got err == nil, want err != nil", test.name)
+			continue
+		case err != nil && !test.wantErr:
+			t.Errorf("TestNew(%s): got err == %s, want err == nil", test.name, err)
+			continue
+		case err != nil:
+			continue
+		}
+		p.Close()
+	}
+}
+
+// TestNewWithLimitedPool covers New's pool selection when the caller's Context carries a Limited
+// pool. Each RequestGroup's output drain loop is a coordinator that lives as long as the group, so
+// with two groups open at once a size-1 pool has one slot for two coordinators that never return it:
+// on the Limited pool the second group's drain loop would never start, its output would never be
+// consumed, and the test would deadlock. New must therefore place coordinators on the default pool.
+func TestNewWithLimitedPool(t *testing.T) {
+	t.Parallel()
+
+	// The pipeline's Context carries a pool that can run exactly one job at a time.
+	ctx := context.SetPool(t.Context(), context.Pool(t.Context()).Limited(t.Context(), "stagedpipeLimited", 1))
+
+	p, err := New[int](ctx, "limited pool", 2, &statsSM{})
+	if err != nil {
+		t.Fatalf("TestNewWithLimitedPool: cannot create pipeline: %s", err)
+	}
+
+	// Two groups open at the same time, so two coordinators are alive at once.
+	rgA := p.NewRequestGroup()
+	rgB := p.NewRequestGroup()
+	// The test's own drains run on the unrestricted Context so that what is under test here is the
+	// library's coordinator placement, not this test's plumbing.
+	doneA := drain(t.Context(), rgA)
+	doneB := drain(t.Context(), rgB)
+
+	const perGroup = 10
+	for i := 0; i < perGroup; i++ {
+		if err := rgA.Submit(Request[int]{Ctx: ctx, Data: i}); err != nil {
+			t.Fatalf("TestNewWithLimitedPool: problem submitting to group A: %s", err)
+		}
+		if err := rgB.Submit(Request[int]{Ctx: ctx, Data: i}); err != nil {
+			t.Fatalf("TestNewWithLimitedPool: problem submitting to group B: %s", err)
+		}
+	}
+	rgA.Close()
+	<-doneA
+	rgB.Close()
+	<-doneB
+	p.Close()
+
+	if got, want := p.Stats().Completed, int64(2*perGroup); got != want {
+		t.Errorf("TestNewWithLimitedPool: got %d completed Requests, want %d", got, want)
 	}
 }

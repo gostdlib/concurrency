@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gostdlib/base/context"
+	"github.com/gostdlib/base/values/sizes"
 
 	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
@@ -82,7 +83,7 @@ func main() {
 		log.Fatalf("cannot start state machine: %s", err)
 	}
 
-	pipeline, err := stagedpipe.New[etl.Data]("boston food violations", concurrency, sm)
+	pipeline, err := stagedpipe.New[etl.Data](ctx, "boston food violations", concurrency, sm)
 	if err != nil {
 		log.Fatalf("cannot create a pipeline: %s", err)
 	}
@@ -194,7 +195,7 @@ func newCSVBlocks[T any](path string, items int) (csvBlocks[T], error) {
 		return csvBlocks[T]{}, err
 	}
 
-	buf := bufio.NewReaderSize(f, 10*1024*1024)
+	buf := bufio.NewReaderSize(f, 10*sizes.MiB)
 
 	r := csv.NewReader(buf)
 	dec, err := csvutil.NewDecoder(r)

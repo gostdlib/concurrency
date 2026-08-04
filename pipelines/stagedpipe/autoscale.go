@@ -207,22 +207,46 @@ func (realClock) tick(d time.Duration) (<-chan time.Time, func()) {
 // by the governor goroutine (loop); live is atomic because runners decrement it as they exit.
 type scaler[T any] struct {
 	stats *stats
-	// spawn1 starts one worker bound to the shared quit channel and live counter. It is a
-	// pipeline runner method value; any pipeline works since all share in/out/sm/stats.
+	// spawn1 starts one worker bound to the shared quit channel and live counter and returns without
+	// waiting for it. It is a pipeline start method value; any pipeline works since all share
+	// in/out/sm/stats. The worker is launched onto the Pipelines' worker Group there, so a worker this
+	// scaler adds is joined by Close like any other, and one removed on scale-down simply leaves the
+	// Group. Close stops the governor before it waits on the Group, so no spawn can race that wait.
 	spawn1 func(quit <-chan struct{}, live *atomic.Int64)
 	quit   chan struct{} // unbuffered: one token removes exactly one worker
 	stop   chan struct{} // closed by Close to stop the governor
-	live   atomic.Int64  // actual live worker goroutines (for introspection/tests)
-	size   int           // governor's target worker count (authoritative for decisions)
-	ctrl   *ctrl
-	clk    clock
+	// done is closed when loop returns. Close joins it before it waits on the worker Group: stop being
+	// closed only means the governor will exit, and a tick already in flight may still be spawning. A
+	// spawn landing inside that wait is a worker the join could miss.
+	done chan struct{}
+	live atomic.Int64 // actual live worker goroutines (for introspection/tests)
+	size int          // governor's target worker count (authoritative for decisions)
+	ctrl *ctrl
+	clk  clock
+
+	// applied, when non-nil, receives once per tick after that tick's decision has been applied. It is
+	// a test seam that makes a tick observable as complete rather than merely delivered, so a test can
+	// drive the governor without polling. Production leaves it nil and pays one nil check per tick.
+	applied chan struct{}
+	// sendGrace overrides asSendGrace in remove. Zero (the production value) means asSendGrace; a test
+	// that asserts on the live worker count sets it high enough that a delivery cannot lose the race
+	// with the timer under load.
+	sendGrace time.Duration
+}
+
+// grace is how long remove will wait to hand one quit token to a worker.
+func (s *scaler[T]) grace() time.Duration {
+	if s.sendGrace == 0 {
+		return asSendGrace
+	}
+	return s.sendGrace
 }
 
 // spawn starts n new workers and returns n.
 func (s *scaler[T]) spawn(n int) int {
 	for i := 0; i < n; i++ {
 		s.live.Add(1)
-		go s.spawn1(s.quit, &s.live)
+		s.spawn1(s.quit, &s.live)
 	}
 	return n
 }
@@ -238,7 +262,7 @@ func (s *scaler[T]) remove(n int) int {
 			removed++
 		case <-s.stop:
 			return removed
-		case <-time.After(asSendGrace):
+		case <-time.After(s.grace()):
 			return removed
 		}
 	}
@@ -256,8 +280,11 @@ func (s *scaler[T]) snapshot() sample {
 }
 
 // loop is the governor: each tick it samples, decides, and applies the worker-count change. It
-// exits when stop is closed.
+// exits when stop is closed. When applied is set it signals there after each tick, which is what
+// lets a test treat a tick as complete instead of polling for its effect.
 func (s *scaler[T]) loop() {
+	defer close(s.done)
+
 	ticks, stop := s.clk.tick(asInterval)
 	defer stop()
 
@@ -275,6 +302,17 @@ func (s *scaler[T]) loop() {
 				s.size -= s.remove(-d.delta)
 			}
 			prev = cur
+			// Announce the tick as applied. Sent after the size change so a receiver observing this is
+			// guaranteed to see the tick's full effect on size, and the receive orders that read. The
+			// stop case keeps a receiver that has gone away from wedging the governor here: Close waits
+			// on the governor before joining the workers, so a loop parked on this send would hang
+			// teardown rather than merely leak.
+			if s.applied != nil {
+				select {
+				case s.applied <- struct{}{}:
+				case <-s.stop:
+				}
+			}
 		}
 	}
 }

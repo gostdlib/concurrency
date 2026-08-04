@@ -8,6 +8,7 @@ import (
 	"github.com/gostdlib/base/context"
 	"github.com/gostdlib/base/errors"
 	"github.com/gostdlib/base/retry/exponential"
+	"github.com/gostdlib/base/values/immutable"
 	"github.com/gostdlib/concurrency/internal/sequencer"
 )
 
@@ -167,8 +168,9 @@ type keyOrder[T any] struct {
 	// keyFunc extracts a Request's partition key from its Data.
 	keyFunc func(T) string
 	// barrierIdx maps an ordered stage's entry PC to its 0-based bit position in Request.clearedMask.
-	// A stage whose PC is absent is not a barrier and runs unordered.
-	barrierIdx map[uintptr]int
+	// A stage whose PC is absent is not a barrier and runs unordered. It is immutable: newKeyOrder
+	// builds it once and every worker then reads it concurrently for the life of the Pipelines.
+	barrierIdx immutable.Map[uintptr, int]
 	// stopKeyOnErr poisons a key on its first Request error when true (WithStopKeyOnErr).
 	stopKeyOnErr bool
 	// admitDepth bounds the Requests in flight per key (WithAdmissionDepth). 0 means unbounded; a
@@ -209,7 +211,7 @@ func newKeyOrder[T any](keyFunc func(T) string, stages []any, stopKeyOnErr bool,
 	}
 	return &keyOrder[T]{
 		keyFunc:      keyFunc,
-		barrierIdx:   barrierIdx,
+		barrierIdx:   immutable.NewMap(barrierIdx),
 		stopKeyOnErr: stopKeyOnErr,
 		admitDepth:   admitDepth,
 		keys:         map[string]*keyState{},
@@ -226,7 +228,7 @@ func (ko *keyOrder[T]) acquire(key string) *keyState {
 
 	ks, ok := ko.keys[key]
 	if !ok {
-		ks = &keyState{key: key, seqs: make([]*sequencer.Sequencer, len(ko.barrierIdx))}
+		ks = &keyState{key: key, seqs: make([]*sequencer.Sequencer, ko.barrierIdx.Len())}
 		for i := range ks.seqs {
 			ks.seqs[i] = sequencer.New()
 		}
@@ -297,7 +299,7 @@ func (ko *keyOrder[T]) exit(req Request[T]) {
 	// Resolve the barriers this Request never cleared. clearedMask has a bit set for each barrier it
 	// resolved in-stage; the rest are stages it branched past, errored before, or (on the cancelled
 	// send path) never reached at all.
-	for _, bit := range ko.barrierIdx {
+	for _, bit := range ko.barrierIdx.All() {
 		if req.clearedMask&(uint64(1)<<uint(bit)) == 0 {
 			ks.seqs[bit].Done(req.seq)
 		}
@@ -348,7 +350,7 @@ func classifyWaitErr(err error) error {
 // already cleared (a stage re-entered in a loop — at most once per Request). It is the only place
 // the ordering hot path computes a stage PC, and only when keyed ordering is on.
 func (ko *keyOrder[T]) barrierBit(stage Stage[T], clearedMask uint64) (bit int, ok bool) {
-	b, marked := ko.barrierIdx[reflect.ValueOf(stage).Pointer()]
+	b, marked := ko.barrierIdx.Get(reflect.ValueOf(stage).Pointer())
 	if !marked {
 		return 0, false
 	}

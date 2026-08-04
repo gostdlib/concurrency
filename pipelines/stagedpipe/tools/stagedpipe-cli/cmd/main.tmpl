@@ -1,12 +1,12 @@
 package main
 
 import (
-    "context"
     "flag"
     "fmt"
     "log"
     "runtime"
 
+    "github.com/gostdlib/base/context"
     "github.com/gostdlib/concurrency/pipelines/stagedpipe"
     "{{ .PackagePath }}"
 )
@@ -26,7 +26,7 @@ func main() {
     }
 
     // Create our parallel and concurrent Pipeline from our StateMachine.
-    pipeline, err := stagedpipe.New[{{ .PackageName }}.Data]("pipeline name", parallelism, xsm)
+    pipeline, err := stagedpipe.New[{{ .PackageName }}.Data](ctx, "pipeline name", parallelism, xsm)
     if err!= nil {
         log.Fatalf("cannot create a pipeline: %s", err)
     }
